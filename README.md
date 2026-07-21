@@ -75,10 +75,20 @@ The binary will be at `target/release/open-forti-manager`.  Run it:
 
 ## Install the .deb package (Ubuntu / Debian)
 
-Download the latest `.deb` from the [Releases](https://github.com/kowalk/open-forti-manager/releases) page, then:
+Download the latest `.deb` from the [Releases](https://github.com/kowalk/open-forti-manager/releases) page, then install:
 
 ```bash
-sudo apt install ./open-forti-manager_*.deb
+# Ubuntu's apt sandbox requires the .deb in a world-readable location.
+# Move it to /tmp first to avoid "Permission denied" errors:
+sudo cp ~/Downloads/open-forti-manager_*.deb /tmp/
+sudo apt install /tmp/open-forti-manager_*.deb
+```
+
+Alternatively, use `dpkg` directly:
+
+```bash
+sudo dpkg -i ~/Downloads/open-forti-manager_*.deb
+sudo apt install -f  # Fix any missing dependencies
 ```
 
 This installs the binary, desktop entry, and all required system dependencies.
