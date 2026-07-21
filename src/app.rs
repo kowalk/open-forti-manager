@@ -31,6 +31,10 @@ pub struct AppWindow {
     status_label: gtk4::Label,
     connect_btn: gtk4::Button,
     was_connected: bool,
+
+    // Tab navigation (used for first-run onboarding)
+    tab_view: libadwaita::TabView,
+    profiles_tab: libadwaita::TabPage,
 }
 
 impl AppWindow {
@@ -110,6 +114,8 @@ impl AppWindow {
 
         // Clone before struct moves them
         let connect_btn_clone = connect_btn.clone();
+        let tab_view = view_stack.clone();
+        let profiles_tab = prof_tab.clone();
 
         // --- Create struct ---
         let slf = Rc::new(RefCell::new(Self {
@@ -127,6 +133,8 @@ impl AppWindow {
             status_label,
             connect_btn,
             was_connected: false,
+            tab_view,
+            profiles_tab,
         }));
 
         // Detect existing VPN connection
@@ -140,6 +148,16 @@ impl AppWindow {
         {
             let cfg = config.borrow();
             slf.borrow().settings.load(&cfg.settings);
+        }
+        // First run: no profiles yet. Create a starter profile and drop the
+        // user straight onto the Profiles tab so they can fill in the gateway
+        // details instead of facing an empty, no-op Connection screen.
+        let first_run = slf.borrow().config.borrow().profiles.is_empty();
+        if first_run {
+            log::info!("First run — no profiles found, creating a starter profile");
+            slf.borrow_mut().new_profile();
+            let this = slf.borrow();
+            this.tab_view.set_selected_page(&this.profiles_tab);
         }
         {
             let s = slf.borrow();
@@ -427,7 +445,19 @@ impl AppWindow {
         if self.vpn.borrow().state().is_active() {
             let _ = self.vpn.borrow_mut().disconnect();
         } else if let Some(p) = self.selected_profile() {
-            let _ = self.vpn.borrow_mut().connect(&p);
+            if p.host.trim().is_empty() {
+                self.connection.append_log(&[
+                    "No gateway configured. Open the Profiles tab and set the VPN host, then Save.".to_string(),
+                ]);
+                self.tab_view.set_selected_page(&self.profiles_tab);
+            } else {
+                let _ = self.vpn.borrow_mut().connect(&p);
+            }
+        } else {
+            self.connection.append_log(&[
+                "No profile selected. Create one on the Profiles tab first.".to_string(),
+            ]);
+            self.tab_view.set_selected_page(&self.profiles_tab);
         }
         self.update_status_ui();
     }

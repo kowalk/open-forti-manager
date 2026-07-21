@@ -24,12 +24,6 @@ rustls-native-certs = "0.7"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 sha2 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
-quick-xml = { version = "0.37", features = ["serialize"] }
-hdlc = "0.4"
-rtnetlink = "0.14"
-netlink-packet-route = "0.19"
-tun-rs = "2.8"
 libc = "0.2"
 
 [package.metadata.deb]
