@@ -11,6 +11,8 @@ pub struct SharedState {
     pub connection_state: ConnectionState,
     pub connected_profile: Option<String>,
     pub show_window: bool,
+    /// Edge-triggered request to bring the window to the front (consumed by poll).
+    pub raise_requested: bool,
     pub quit_requested: bool,
     pub force_quit: bool,
     pub quick_connect_requested: bool,
@@ -24,6 +26,7 @@ impl SharedState {
             connection_state: ConnectionState::Disconnected,
             connected_profile: None,
             show_window: true,
+            raise_requested: false,
             quit_requested: false,
             force_quit: false,
             quick_connect_requested: false,
@@ -156,6 +159,7 @@ impl Tray for AppTray {
                 activate: Box::new(move |_tray: &mut Self| {
                     if let Ok(mut s) = show_state.write() {
                         s.show_window = true;
+                        s.raise_requested = true; // bring to front even if already open
                     }
                 }),
                 ..Default::default()
@@ -196,10 +200,13 @@ impl Tray for AppTray {
         ]
     }
 
-    /// Left-click → toggle window visibility.
+    /// Left-click → toggle window visibility; when showing, raise to front.
     fn activate(&mut self, _x: i32, _y: i32) {
         if let Ok(mut s) = self.state.write() {
             s.show_window = !s.show_window;
+            if s.show_window {
+                s.raise_requested = true;
+            }
         }
     }
 }

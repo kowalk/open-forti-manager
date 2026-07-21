@@ -1,6 +1,6 @@
 [package]
 name = "open-forti-manager"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 description = "Native Fortinet SSL-VPN client for Linux with a GTK4 GUI — pure-Rust TLS, SAML, and PPP/IPCP engine (no openfortivpn or pppd), system tray, and profile management"
 license = "MIT"

@@ -325,9 +325,29 @@ impl AppWindow {
         let h = self.tray_handle.clone();
         let _ = self.rt.block_on(async { h.update(|_| {}).await });
 
-        // Tray show request
-        if self.shared.read().unwrap().show_window {
-            self.window.present();
+        // Tray show/hide + raise handling.
+        {
+            let mut s = self.shared.write().unwrap();
+            let raise = s.raise_requested;
+            s.raise_requested = false;
+            let show = s.show_window;
+            drop(s);
+
+            if raise {
+                // Bring the window to the front, even when it's already open but
+                // buried under another window. A plain present() does not reliably
+                // restack an already-mapped window on some compositors (focus-
+                // stealing prevention), so cycle visibility to force a fresh map,
+                // which the compositor places on top and focuses.
+                if self.window.is_visible() {
+                    self.window.set_visible(false);
+                }
+                self.window.set_visible(true);
+                self.window.present();
+            } else if !show && self.window.is_visible() {
+                // Left-click toggle requested hide.
+                self.window.set_visible(false);
+            }
         }
 
         // Tray Quit request — show dialog on GTK thread (only once)
