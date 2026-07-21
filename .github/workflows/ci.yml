@@ -2,7 +2,7 @@ name: CI
 
 # Build and test on every push and pull request to the main branch.
 # Tag pushes are ignored here so tagged releases only run the release
-# workflow (release.yml) instead of building twice concurrently.
+# workflow (release.yml), which calls the same reusable test workflow.
 on:
   push:
     branches: [master]
@@ -13,45 +13,9 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-24.04
     # A release bumps the version on master AND pushes a tag. The tag runs
-    # release.yml; the accompanying "Release vX.Y.Z" commit on master would
-    # otherwise also trigger CI here. Skip it so a release runs the Release
-    # build only. (head_commit is null for PRs / manual runs, so those proceed.)
+    # release.yml (which already runs the tests); the accompanying
+    # "Release vX.Y.Z" commit on master would otherwise also trigger CI here.
+    # (head_commit is null for PRs / manual runs, so those proceed.)
     if: ${{ !startsWith(github.event.head_commit.message, 'Release v') }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            libayatana-appindicator3-dev \
-            libx11-dev \
-            libglib2.0-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Build
-        run: cargo build --release --locked
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Clippy (warnings only, non-blocking)
-        run: cargo clippy --all-targets || true
+    uses: ./.github/workflows/test.yml

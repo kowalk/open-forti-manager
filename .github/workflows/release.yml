@@ -15,8 +15,14 @@ permissions:
   contents: write
 
 jobs:
+  # Run the shared build/test workflow first — the release .deb is only
+  # built and published if it passes.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build-deb:
     runs-on: ubuntu-24.04
+    needs: test
     steps:
       - uses: actions/checkout@v4
 
