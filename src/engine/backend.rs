@@ -103,6 +103,35 @@ fn parse_split_dns_domains(xml: &str) -> Vec<String> {
     domains
 }
 
+/// Run a shell script with the privileges required for network configuration
+/// (routes, DNS). Tries, in order: run directly if already root, passwordless
+/// `sudo -n`, then a single graphical `pkexec` prompt. Returns the method used
+/// alongside the command output so the caller can report success/failure.
+fn run_privileged(script: &str) -> std::io::Result<(&'static str, std::process::Output)> {
+    use std::process::{Command, Stdio};
+
+    // Already root (e.g. launched via sudo/pkexec)?
+    if unsafe { libc::geteuid() } == 0 {
+        return Command::new("sh").args(["-c", script]).output().map(|o| ("root", o));
+    }
+
+    // Passwordless sudo available?
+    let sudo_ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if sudo_ok {
+        return Command::new("sudo").args(["-n", "sh", "-c", script]).output().map(|o| ("sudo", o));
+    }
+
+    // Fall back to a single graphical polkit prompt covering the whole batch.
+    Command::new("pkexec").args(["sh", "-c", script]).output().map(|o| ("pkexec", o))
+}
+
 /// Native VPN backend that speaks the Fortinet SSL-VPN protocol directly.
 pub struct NativeVpnBackend {
     state: ConnectionState,
@@ -346,11 +375,27 @@ fn connect_inner_impl(
             };
             script.push_str(&format!("resolvectl domain {} {}\n", ifname, domain_args.join(" ")));
         }
+        let log2 = log.clone();
         std::thread::spawn(move || {
-            let _ = std::process::Command::new("sudo").args(["-n", "sh", "-c", &script]).output();
-            log::info!("Routes, DNS and split-DNS domains configured for {}", ifname);
+            match run_privileged(&script) {
+                Ok((method, out)) if out.status.success() => {
+                    let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", method));
+                }
+                Ok((method, out)) => {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    let err = err.trim();
+                    let _ = log2.send(format!(
+                        "[engine] WARNING: network setup via {} failed{}. Routes/DNS not applied — internal hosts may not resolve.",
+                        method,
+                        if err.is_empty() { String::new() } else { format!(": {}", err) },
+                    ));
+                }
+                Err(e) => {
+                    let _ = log2.send(format!("[engine] WARNING: could not elevate for network setup: {}", e));
+                }
+            }
         });
-        let _ = log.send(format!("[engine] Configuring {} routes + DNS ({} domains) in background",
+        let _ = log.send(format!("[engine] Applying {} routes + DNS ({} domains) — a privilege prompt may appear…",
             vpn_routes.len(), vpn_domains.len()));
     }
     let ppp_in = pppd.writer();
