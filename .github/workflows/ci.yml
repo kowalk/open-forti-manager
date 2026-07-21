@@ -14,6 +14,11 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-24.04
+    # A release bumps the version on master AND pushes a tag. The tag runs
+    # release.yml; the accompanying "Release vX.Y.Z" commit on master would
+    # otherwise also trigger CI here. Skip it so a release runs the Release
+    # build only. (head_commit is null for PRs / manual runs, so those proceed.)
+    if: ${{ !startsWith(github.event.head_commit.message, 'Release v') }}
     steps:
       - uses: actions/checkout@v4
 
