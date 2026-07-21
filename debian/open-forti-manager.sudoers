@@ -1,0 +1,11 @@
+# Managed by the open-forti-manager package — do not edit.
+#
+# Lets the native Fortinet SSL-VPN client configure split-tunnel routes and
+# per-link DNS without a password prompt on connect. The grant is scoped to the
+# exact commands the app runs (kernel route table + systemd-resolved link
+# config). These subcommands cannot execute arbitrary programs, so this does
+# NOT grant a general passwordless root shell.
+#
+# Applies to members of the 'sudo' group (Ubuntu/Debian administrators), who can
+# already run these commands with a password — this only removes the prompt.
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/bin/resolvectl *

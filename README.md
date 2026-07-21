@@ -73,13 +73,26 @@ capability. You do **not** need to run the whole GUI as root:
   sudo setcap cap_net_admin+eip target/release/open-forti-manager
   ```
 
-Route and DNS setup additionally use `sudo` (`ip`, `resolvectl`). For a smooth,
-prompt-free experience, allow those commands via a passwordless sudoers rule,
-e.g. in `/etc/sudoers.d/open-forti-manager`:
+Route and DNS setup additionally need root (`ip route`, `resolvectl`). The app
+elevates with the least privilege available, in order:
+
+1. run directly if already root;
+2. **passwordless `sudo`** for the exact `ip route` / `resolvectl` commands, if a
+   sudoers rule allows it (no prompt);
+3. otherwise a single **`pkexec`** prompt per connect.
+
+The **`.deb` installs the narrow sudoers rule automatically** (validated with
+`visudo` first, and removed on uninstall), so connecting is prompt-free out of
+the box. For a **source build**, add it yourself if you want no prompt — note it
+is scoped to the route-table / resolved commands only, *not* a root shell:
 
 ```
-%yourgroup ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/bin/resolvectl
+# /etc/sudoers.d/open-forti-manager  (mode 0440)
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/bin/resolvectl *
 ```
+
+Without any such rule, everything still works — you just get one `pkexec`
+prompt each time you connect.
 
 ## Dependencies
 

@@ -103,33 +103,99 @@ fn parse_split_dns_domains(xml: &str) -> Vec<String> {
     domains
 }
 
-/// Run a shell script with the privileges required for network configuration
-/// (routes, DNS). Tries, in order: run directly if already root, passwordless
-/// `sudo -n`, then a single graphical `pkexec` prompt. Returns the method used
-/// alongside the command output so the caller can report success/failure.
-fn run_privileged(script: &str) -> std::io::Result<(&'static str, std::process::Output)> {
+// Absolute paths the app invokes for network config. These must match the
+// Cmnd entries in the packaged sudoers drop-in (debian/open-forti-manager.sudoers)
+// so that `sudo -n` succeeds non-interactively without granting a root shell.
+const IP_BIN: &str = "/usr/sbin/ip";
+const RESOLVECTL_BIN: &str = "/usr/bin/resolvectl";
+
+/// How network configuration commands should be elevated.
+enum Elevation {
+    /// Already root — run directly.
+    Root,
+    /// Narrow passwordless sudo (packaged sudoers rule) — run each command via `sudo -n`.
+    SudoPerCmd,
+    /// No standing privilege — run the batch once behind a graphical pkexec prompt.
+    Pkexec,
+}
+
+/// Decide how to elevate. Probes whether we can run our exact `ip route` command
+/// non-interactively (which the packaged sudoers rule allows); anything broader
+/// like general passwordless sudo also satisfies this probe.
+fn detect_elevation() -> Elevation {
     use std::process::{Command, Stdio};
-
-    // Already root (e.g. launched via sudo/pkexec)?
     if unsafe { libc::geteuid() } == 0 {
-        return Command::new("sh").args(["-c", script]).output().map(|o| ("root", o));
+        return Elevation::Root;
     }
-
-    // Passwordless sudo available?
-    let sudo_ok = Command::new("sudo")
-        .args(["-n", "true"])
+    let can_sudo = Command::new("sudo")
+        .args(["-n", IP_BIN, "route", "show"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if sudo_ok {
-        return Command::new("sudo").args(["-n", "sh", "-c", script]).output().map(|o| ("sudo", o));
-    }
+    if can_sudo { Elevation::SudoPerCmd } else { Elevation::Pkexec }
+}
 
-    // Fall back to a single graphical polkit prompt covering the whole batch.
-    Command::new("pkexec").args(["sh", "-c", script]).output().map(|o| ("pkexec", o))
+/// Single-quote an argument for safe inclusion in an `sh -c` batch (used only on
+/// the root/pkexec paths). Prevents e.g. `~domain` from being tilde-expanded.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Apply the network-config command list with the least privilege available.
+/// Returns (method, ok, detail) for logging. Route-add failures (e.g. a duplicate
+/// route already present) are non-fatal; DNS failures are surfaced.
+fn apply_network_config(commands: &[Vec<String>]) -> (&'static str, bool, String) {
+    use std::process::Command;
+
+    match detect_elevation() {
+        Elevation::SudoPerCmd => {
+            let mut failures = String::new();
+            for cmd in commands {
+                let out = Command::new("sudo").arg("-n").args(cmd).output();
+                match out {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let is_route = cmd.first().map(|c| c == IP_BIN).unwrap_or(false);
+                        // Ignore "route already exists"-style noise from ip route.
+                        if !is_route {
+                            failures.push_str(&String::from_utf8_lossy(&o.stderr));
+                        }
+                    }
+                    Err(e) => failures.push_str(&e.to_string()),
+                }
+            }
+            ("sudo", failures.is_empty(), failures.trim().to_string())
+        }
+        elev => {
+            // Root or pkexec: run the whole batch in one shell invocation.
+            let script = commands
+                .iter()
+                .map(|c| {
+                    let line = c.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+                    // Tolerate duplicate routes without aborting the batch.
+                    if c.first().map(|x| x == IP_BIN).unwrap_or(false) {
+                        format!("{} 2>/dev/null || true", line)
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let (method, out) = match elev {
+                Elevation::Root => ("root", Command::new("sh").args(["-c", &script]).output()),
+                _ => ("pkexec", Command::new("pkexec").args(["sh", "-c", &script]).output()),
+            };
+            match out {
+                Ok(o) if o.status.success() => (method, true, String::new()),
+                Ok(o) => (method, false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                Err(e) => (method, false, e.to_string()),
+            }
+        }
+    }
 }
 
 /// Native VPN backend that speaks the Fortinet SSL-VPN protocol directly.
@@ -355,15 +421,22 @@ fn connect_inner_impl(
     }
     let _ = log.send(format!("[engine] TUN {} configured with {}", pppd.iface_name(), vpn_ip));
 
-    // Add split-tunnel routes and DNS in one batched sudo call
+    // Build the split-tunnel route + DNS commands as an explicit argv list, so
+    // each can be matched by the narrow packaged sudoers rule (no root shell).
     let ifname = pppd.iface_name();
     if !vpn_routes.is_empty() || !vpn_dns.is_empty() {
-        let mut script = String::new();
+        let mut commands: Vec<Vec<String>> = Vec::new();
         for (net, mask) in &vpn_routes {
-            script.push_str(&format!("ip route add {}/{} dev {} 2>/dev/null\n", net, mask, ifname));
+            commands.push(vec![
+                IP_BIN.into(), "route".into(), "add".into(),
+                format!("{}/{}", net, mask), "dev".into(), ifname.clone(),
+            ]);
         }
         if !vpn_dns.is_empty() {
-            script.push_str(&format!("resolvectl dns {} {}\n", ifname, vpn_dns.join(" ")));
+            let mut dns_cmd = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.clone()];
+            dns_cmd.extend(vpn_dns.iter().cloned());
+            commands.push(dns_cmd);
+
             // Route the split-DNS domains to the VPN DNS servers. The '~' prefix
             // marks them as routing-only domains so *.domain lookups use vpn0's DNS.
             // Fall back to a wildcard so all lookups prefer the VPN DNS if the
@@ -373,29 +446,25 @@ fn connect_inner_impl(
             } else {
                 vpn_domains.iter().map(|d| format!("~{}", d)).collect()
             };
-            script.push_str(&format!("resolvectl domain {} {}\n", ifname, domain_args.join(" ")));
+            let mut dom_cmd = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.clone()];
+            dom_cmd.extend(domain_args);
+            commands.push(dom_cmd);
         }
+
         let log2 = log.clone();
         std::thread::spawn(move || {
-            match run_privileged(&script) {
-                Ok((method, out)) if out.status.success() => {
-                    let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", method));
-                }
-                Ok((method, out)) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    let err = err.trim();
-                    let _ = log2.send(format!(
-                        "[engine] WARNING: network setup via {} failed{}. Routes/DNS not applied — internal hosts may not resolve.",
-                        method,
-                        if err.is_empty() { String::new() } else { format!(": {}", err) },
-                    ));
-                }
-                Err(e) => {
-                    let _ = log2.send(format!("[engine] WARNING: could not elevate for network setup: {}", e));
-                }
+            let (method, ok, detail) = apply_network_config(&commands);
+            if ok {
+                let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", method));
+            } else {
+                let _ = log2.send(format!(
+                    "[engine] WARNING: network setup via {} failed{}. Internal hosts may not resolve.",
+                    method,
+                    if detail.is_empty() { String::new() } else { format!(": {}", detail) },
+                ));
             }
         });
-        let _ = log.send(format!("[engine] Applying {} routes + DNS ({} domains) — a privilege prompt may appear…",
+        let _ = log.send(format!("[engine] Applying {} routes + DNS ({} domains) — a privilege prompt may appear if no sudoers rule is installed…",
             vpn_routes.len(), vpn_domains.len()));
     }
     let ppp_in = pppd.writer();

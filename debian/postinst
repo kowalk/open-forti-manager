@@ -1,15 +1,21 @@
 #!/bin/sh
 # Post-installation script for open-forti-manager.
 #
-# Grants the CAP_NET_ADMIN capability to the installed binary so the native
-# VPN engine can create/configure the TUN interface without running the whole
-# GUI as root.
+# 1. Grants CAP_NET_ADMIN to the binary so the native VPN engine can
+#    create/configure the TUN interface without running the GUI as root.
+# 2. Installs a narrow sudoers rule so routes/DNS can be applied on connect
+#    without a password prompt. The rule is validated with visudo BEFORE it is
+#    activated — a malformed file in /etc/sudoers.d could otherwise break sudo
+#    system-wide.
 set -e
 
 BIN="/usr/bin/open-forti-manager"
+SUDOERS_SRC="/usr/share/open-forti-manager/open-forti-manager.sudoers"
+SUDOERS_DST="/etc/sudoers.d/open-forti-manager"
 
 case "$1" in
     configure)
+        # --- (1) CAP_NET_ADMIN ---
         if command -v setcap >/dev/null 2>&1; then
             if setcap cap_net_admin+eip "$BIN"; then
                 echo "open-forti-manager: granted cap_net_admin to $BIN"
@@ -20,6 +26,22 @@ case "$1" in
         else
             echo "open-forti-manager: WARNING — 'setcap' not found (install libcap2-bin)." >&2
             echo "  Then run: sudo setcap cap_net_admin+eip $BIN" >&2
+        fi
+
+        # --- (2) sudoers rule (validated before activation) ---
+        if [ -f "$SUDOERS_SRC" ]; then
+            if command -v visudo >/dev/null 2>&1; then
+                if visudo -cf "$SUDOERS_SRC" >/dev/null 2>&1; then
+                    install -m 0440 -o root -g root "$SUDOERS_SRC" "$SUDOERS_DST"
+                    echo "open-forti-manager: installed sudoers rule at $SUDOERS_DST"
+                else
+                    echo "open-forti-manager: WARNING — sudoers rule failed validation; not installed." >&2
+                    echo "  Route/DNS setup will use a pkexec prompt instead." >&2
+                fi
+            else
+                echo "open-forti-manager: WARNING — 'visudo' not found; skipping sudoers rule." >&2
+                echo "  Route/DNS setup will use a pkexec prompt instead." >&2
+            fi
         fi
         ;;
 esac

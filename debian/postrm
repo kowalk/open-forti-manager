@@ -1,0 +1,19 @@
+#!/bin/sh
+# Post-removal script for open-forti-manager.
+#
+# Removes the sudoers drop-in installed by postinst. Done on both remove and
+# purge so no dangling privilege grant is left behind after uninstall.
+set -e
+
+SUDOERS_DST="/etc/sudoers.d/open-forti-manager"
+
+case "$1" in
+    remove|purge)
+        if [ -f "$SUDOERS_DST" ]; then
+            rm -f "$SUDOERS_DST"
+            echo "open-forti-manager: removed sudoers rule $SUDOERS_DST"
+        fi
+        ;;
+esac
+
+exit 0
