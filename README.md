@@ -1,16 +1,27 @@
 # OpenForti Manager
 
-A native GTK4 + libadwaita GUI front-end for [openfortivpn](https://github.com/adrienverge/openfortivpn), the Fortinet SSL-VPN client.
+A native Fortinet SSL-VPN client for Linux with a GTK4 + libadwaita GUI.
+
+Unlike a thin front-end, OpenForti Manager speaks the Fortinet SSL-VPN protocol
+**directly** — TLS handshake, HTTP/SAML authentication, tunnel allocation, and a
+pure-Rust **PPP state machine** (LCP + IPCP) over a TUN device. There is **no
+external `openfortivpn` binary and no `pppd`** — the entire data path is
+implemented in Rust.
 
 ## Features
 
+- **Fully native VPN engine** — TLS, auth, PPP/IPCP negotiation, and TUN data
+  relay implemented in Rust; no `openfortivpn` or `pppd` processes
 - **VPN profile management** — create, edit, and save multiple connection profiles
-- **System tray integration** — background mode with status indicator icon (green/orange/red)
-- **SAML login support** — auto-opens the authentication URL in your browser
-- **Certificate trust management** — configure CA bundles, user certificates, and trusted SHA256 digests
-- **Quick Connect** — reconnect to the last used profile from the tray menu
+- **SAML login support** — auto-opens the authentication URL in your browser and
+  captures the callback locally
+- **Certificate trust management** — configure CA bundles, user certificates, and
+  trusted SHA256 digests (`--trusted-cert`)
+- **Split tunneling & split DNS** — installs the gateway's routes and routes the
+  gateway's DNS domains (`*.corp.example`) to the VPN resolvers automatically
+- **System tray integration** — background mode with a status indicator icon
+- **Quick Connect / Disconnect** from the tray menu
 - **Minimize after connect** — window auto-hides to tray when the tunnel comes up
-- **Auto-detection** — recognizes manually-started openfortivpn sessions and shows their status
 
 ## Screenshot
 
@@ -23,40 +34,83 @@ A native GTK4 + libadwaita GUI front-end for [openfortivpn](https://github.com/a
 │ Profile: [My Corp VPN ▾]                     │
 │                                              │
 │ ┌─ Log ────────────────────────────────────┐ │
-│ │ [out] INFO:   Tunnel is up.              │ │
-│ │ [out] INFO:   Connected to gateway.      │ │
+│ │ [engine] PPP: NETWORK phase reached —    │ │
+│ │          tunnel is fully established!    │ │
 │ └──────────────────────────────────────────┘ │
 └──────────────────────────────────────────────┘
+```
+
+## How it works
+
+On **Connect**, the native engine:
+
+1. Opens a TLS connection to the gateway (with optional trusted-cert pinning).
+2. Authenticates — password or **SAML** (opens the browser, waits for the
+   callback on a local port, exchanges the session ID for the `SVPNCOOKIE`).
+3. Allocates a tunnel slot and fetches the VPN config (assigned IP, DNS servers,
+   split routes, split-DNS domains).
+4. Creates a **TUN** interface and runs a pure-Rust **PPP** negotiation
+   (LCP → IPCP) until the link reaches the **network** phase.
+5. Configures the interface IP, installs split-tunnel routes, sets the VPN DNS
+   servers and routes the split-DNS domains to them.
+6. Relays IP packets between the TUN device and the gateway over TLS.
+
+The system tray icon shows the connection state:
+- **Gray** — disconnected
+- **Orange** — connecting
+- **Green** — connected
+- **Red** — error
+
+### Privileges
+
+Creating and configuring the TUN interface requires the **`CAP_NET_ADMIN`**
+capability. You do **not** need to run the whole GUI as root:
+
+- The **`.deb` package sets this automatically** on install (see below).
+- For a **source build**, grant it once after building:
+
+  ```bash
+  sudo setcap cap_net_admin+eip target/release/open-forti-manager
+  ```
+
+Route and DNS setup additionally use `sudo` (`ip`, `resolvectl`). For a smooth,
+prompt-free experience, allow those commands via a passwordless sudoers rule,
+e.g. in `/etc/sudoers.d/open-forti-manager`:
+
+```
+%yourgroup ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/bin/resolvectl
 ```
 
 ## Dependencies
 
 | Package | Purpose |
 |----------|---------|
-| `openfortivpn` | The VPN client itself |
-| `libgtk-4-dev` | GTK4 GUI toolkit |
-| `libadwaita-1-dev` | Modern GNOME widgets |
-| `libayatana-appindicator3-dev` | System tray support |
-| `pkexec` (from `polkit`) | Privilege escalation for the VPN process |
+| `libgtk-4-1` | GTK4 GUI toolkit |
+| `libadwaita-1-0` | Modern GNOME widgets |
+| `libayatana-appindicator3-1` | System tray support |
+| `libcap2-bin` | Provides `setcap` for granting `CAP_NET_ADMIN` |
+| `pkexec` (from `polkit`) | Privilege escalation for teardown helpers |
 
-**Ubuntu / Debian:**
+> Note: `openfortivpn` is **no longer required** — the VPN engine is native.
+
+**Ubuntu / Debian (build):**
 ```bash
-sudo apt install openfortivpn libgtk-4-dev libadwaita-1-dev \
+sudo apt install libgtk-4-dev libadwaita-1-dev \
   libayatana-appindicator3-dev libx11-dev libglib2.0-dev \
-  gcc pkg-config
+  libcap2-bin gcc pkg-config
 ```
 
-**Fedora:**
+**Fedora (build):**
 ```bash
-sudo dnf install openfortivpn gtk4-devel libadwaita-devel \
+sudo dnf install gtk4-devel libadwaita-devel \
   libayatana-appindicator3-devel libX11-devel glib2-devel \
-  gcc pkg-config
+  libcap gcc pkg-config
 ```
 
-**Arch Linux:**
+**Arch Linux (build):**
 ```bash
-sudo pacman -S openfortivpn gtk4 libadwaita \
-  libayatana-appindicator gcc pkgconf
+sudo pacman -S gtk4 libadwaita libayatana-appindicator \
+  libcap gcc pkgconf
 ```
 
 ## Build from source
@@ -65,9 +119,12 @@ sudo pacman -S openfortivpn gtk4 libadwaita \
 git clone https://github.com/kowalk/open-forti-manager.git
 cd open-forti-manager
 cargo build --release
+
+# Grant the network capability (needed to create the TUN device):
+sudo setcap cap_net_admin+eip target/release/open-forti-manager
 ```
 
-The binary will be at `target/release/open-forti-manager`.  Run it:
+Run it:
 
 ```bash
 ./target/release/open-forti-manager
@@ -91,17 +148,9 @@ sudo dpkg -i ~/Downloads/open-forti-manager_*.deb
 sudo apt install -f  # Fix any missing dependencies
 ```
 
-This installs the binary, desktop entry, and all required system dependencies.
-
-## How it works
-
-OpenForti Manager spawns `openfortivpn` via `pkexec` for privilege escalation.  A Polkit password dialog appears when you click **Connect**.  Log output from the openfortivpn process is captured and displayed in the **Connection** tab.
-
-The system tray icon shows the connection state:
-- **Gray** — disconnected
-- **Orange** — connecting
-- **Green** — connected
-- **Red** — error
+The package's post-install script automatically runs
+`setcap cap_net_admin+eip /usr/bin/open-forti-manager`, so the app can create the
+TUN interface without being run as root.
 
 ## Configuration
 
@@ -113,7 +162,9 @@ Profiles and settings are stored in:
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org/).  Version tags (`vMAJOR.MINOR.PATCH`) trigger the GitHub Actions release workflow, which builds and publishes a `.deb` package.
+This project follows [Semantic Versioning](https://semver.org/). Version tags
+(`vMAJOR.MINOR.PATCH`) trigger the GitHub Actions release workflow, which builds
+and publishes a `.deb` package (with the capability-granting post-install script).
 
 ## License
 

@@ -40,6 +40,9 @@ jobs:
         run: cargo build --release
 
       - name: Build .deb package
+        # cargo-deb embeds debian/postinst, which runs
+        # `setcap cap_net_admin+eip /usr/bin/open-forti-manager` after install
+        # so the native VPN engine can create the TUN device without root.
         run: cargo deb --no-build
 
       - name: Find .deb file
@@ -48,6 +51,15 @@ jobs:
           DEB=$(ls target/debian/*.deb | head -1)
           echo "path=$DEB" >> "$GITHUB_OUTPUT"
           echo "name=$(basename $DEB)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify postinst grants cap_net_admin
+        run: |
+          DEB="${{ steps.deb.outputs.path }}"
+          if ! dpkg-deb --info "$DEB" postinst | grep -q "cap_net_admin+eip"; then
+            echo "::error::postinst is missing the setcap cap_net_admin step"
+            exit 1
+          fi
+          echo "postinst correctly sets cap_net_admin on install."
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

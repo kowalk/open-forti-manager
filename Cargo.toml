@@ -1,6 +1,6 @@
 [package]
 name = "open-forti-manager"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 description = "GTK4 GUI front-end for openfortivpn with system tray integration, profile management, and SAML support"
 license = "MIT"
@@ -19,12 +19,25 @@ env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.7"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+hdlc = "0.4"
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+tun-rs = "2.8"
+libc = "0.2"
 
 [package.metadata.deb]
 maintainer = "OpenForti Manager contributors"
-depends = "openfortivpn, libgtk-4-1, libadwaita-1-0, libayatana-appindicator3-1, pkexec | polkit"
+depends = "libgtk-4-1, libadwaita-1-0, libayatana-appindicator3-1, libcap2-bin, pkexec | polkit"
 section = "net"
 priority = "optional"
+maintainer-scripts = "debian/"
 assets = [
     ["target/release/open-forti-manager", "usr/bin/open-forti-manager", "755"],
     ["assets/open-forti-manager.desktop", "usr/share/applications/open-forti-manager.desktop", "644"],

@@ -5,11 +5,16 @@ mod config;
 mod tray;
 mod ui;
 mod vpn;
+mod engine;
 
 use crate::app::AppWindow;
 use crate::config::AppConfig;
+use crate::engine::backend::NativeVpnBackend;
 use crate::tray::{spawn_tray, SharedState};
+use crate::vpn::VpnBackend;
 use gtk4::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 fn main() {
@@ -43,6 +48,10 @@ fn main() {
         gtk4::gio::ApplicationFlags::default(),
     );
 
+    // --- Native VPN backend ---
+    let vpn_backend: Rc<RefCell<dyn VpnBackend>> =
+        Rc::new(RefCell::new(NativeVpnBackend::new()));
+
     let shared_for_app = shared.clone();
     let config_for_app = config.clone();
 
@@ -54,6 +63,7 @@ fn main() {
             shared_for_app.clone(),
             tray_handle.clone(),
             rt.handle().clone(),
+            vpn_backend.clone(),
         );
     });
 

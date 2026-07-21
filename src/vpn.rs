@@ -41,7 +41,9 @@ pub trait VpnBackend {
     fn disconnect(&mut self) -> Result<(), String>;
     fn check_status(&mut self);
     fn state(&self) -> &ConnectionState;
+    fn set_state(&mut self, s: ConnectionState);
     fn drain_log(&mut self) -> Vec<String>;
+    fn is_running_global() -> bool where Self: Sized;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,17 +75,9 @@ pub struct VpnManager {
 }
 
 impl VpnManager {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self { process: None, state: ConnectionState::Disconnected, log: Vec::new() }
-    }
-
-    pub fn set_state(&mut self, s: ConnectionState) { self.state = s; }
-
-    pub fn is_running_global() -> bool {
-        std::process::Command::new("pgrep")
-            .args(["openfortivpn"])
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .status().map(|s| s.success()).unwrap_or(false)
     }
 
     /// Synchronous disconnect — blocks until pkexec kills complete.
@@ -230,6 +224,15 @@ impl VpnBackend for VpnManager {
     }
 
     fn state(&self) -> &ConnectionState { &self.state }
+
+    fn set_state(&mut self, s: ConnectionState) { self.state = s; }
+
+    fn is_running_global() -> bool {
+        std::process::Command::new("pgrep")
+            .args(["openfortivpn"])
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false)
+    }
 
     fn drain_log(&mut self) -> Vec<String> {
         let mut new = Vec::new();

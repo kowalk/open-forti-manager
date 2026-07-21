@@ -5,7 +5,7 @@ use crate::ui::connection::ConnectionPage;
 use crate::ui::helpers::opt;
 use crate::ui::profiles::ProfilesPage;
 use crate::ui::settings::SettingsPage;
-use crate::vpn::{ConnectionState, VpnBackend, VpnManager};
+use crate::vpn::{ConnectionState, VpnBackend};
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
@@ -16,7 +16,7 @@ pub struct AppWindow {
     window: libadwaita::ApplicationWindow,
     config: Rc<RefCell<AppConfig>>,
     shared: Arc<RwLock<SharedState>>,
-    vpn: Rc<RefCell<VpnManager>>,
+    vpn: Rc<RefCell<dyn VpnBackend>>,
     tray_handle: ksni::Handle<crate::tray::AppTray>,
     rt: tokio::runtime::Handle,
 
@@ -40,9 +40,9 @@ impl AppWindow {
         shared: Arc<RwLock<SharedState>>,
         tray_handle: ksni::Handle<crate::tray::AppTray>,
         rt: tokio::runtime::Handle,
+        vpn: Rc<RefCell<dyn VpnBackend>>,
     ) -> Rc<RefCell<Self>> {
         let config = Rc::new(RefCell::new(config));
-        let vpn = Rc::new(RefCell::new(VpnManager::new()));
 
         // --- Window ---
         let window = libadwaita::ApplicationWindow::new(app);
@@ -130,7 +130,7 @@ impl AppWindow {
         }));
 
         // Detect existing VPN connection
-        if VpnManager::is_running_global() {
+        if crate::vpn::VpnManager::is_running_global() {
             vpn.borrow_mut().set_state(ConnectionState::Connected);
             log::info!("Detected existing VPN connection");
         }
@@ -241,8 +241,10 @@ impl AppWindow {
     // ------------------------------------------------------------------
 
     fn poll(&mut self) {
-        self.vpn.borrow_mut().check_status();
+        // Drain logs FIRST so they're available for display,
+        // then check status (which may scan the drained logs for state changes)
         let new_lines = self.vpn.borrow_mut().drain_log();
+        self.vpn.borrow_mut().check_status();
 
         // Handle tray Quick Connect / Disconnect requests
         {
@@ -326,7 +328,18 @@ impl AppWindow {
     /// Ask the user whether to keep or disconnect the VPN before quitting.
     fn show_quit_dialog(&self) {
         if !self.vpn.borrow().state().is_active() {
-            self.window.close();
+            // Force an actual quit (bypass minimize-to-tray) and defer the close
+            // to an idle callback: show_quit_dialog may be reached from within
+            // poll(), which holds a mutable borrow of the AppWindow RefCell.
+            // Calling window.close() there would synchronously fire the
+            // close_request handler, which borrows the same RefCell → panic.
+            if let Ok(mut s) = self.shared.write() {
+                s.force_quit = true;
+            }
+            let window = self.window.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                window.close();
+            });
             return;
         }
 
@@ -363,9 +376,8 @@ impl AppWindow {
                     window.close();
                 }
                 RESP_DISCONNECT => {
-                    // Use synchronous disconnect so the pkexec password
-                    // dialog completes before we exit the app
-                    let _ = vpn.borrow_mut().disconnect_sync();
+                    let _ = vpn.borrow_mut().disconnect();
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
                     if let Ok(mut s) = shared.write() {
                         s.force_quit = true;
                     }

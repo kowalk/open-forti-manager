@@ -1,0 +1,27 @@
+#!/bin/sh
+# Post-installation script for open-forti-manager.
+#
+# Grants the CAP_NET_ADMIN capability to the installed binary so the native
+# VPN engine can create/configure the TUN interface without running the whole
+# GUI as root.
+set -e
+
+BIN="/usr/bin/open-forti-manager"
+
+case "$1" in
+    configure)
+        if command -v setcap >/dev/null 2>&1; then
+            if setcap cap_net_admin+eip "$BIN"; then
+                echo "open-forti-manager: granted cap_net_admin to $BIN"
+            else
+                echo "open-forti-manager: WARNING — failed to set cap_net_admin on $BIN." >&2
+                echo "  Run manually: sudo setcap cap_net_admin+eip $BIN" >&2
+            fi
+        else
+            echo "open-forti-manager: WARNING — 'setcap' not found (install libcap2-bin)." >&2
+            echo "  Then run: sudo setcap cap_net_admin+eip $BIN" >&2
+        fi
+        ;;
+esac
+
+exit 0
