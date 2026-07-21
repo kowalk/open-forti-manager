@@ -3,10 +3,13 @@
 //! Implements `VpnBackend` using our pure-Rust engine: TLS → Auth → PPP → Tunnel.
 
 use crate::config::VpnProfile;
-use crate::engine::{self, auth, gateway, ppp, routes, tunnel, VpnError};
+use crate::engine::{auth, gateway, ppp, tunnel, VpnError};
 use crate::vpn::{ConnectionState, VpnBackend};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Extract assigned IP from FortiGate XML (attribute form: ipv4='x.x.x.x').
 fn parse_vpn_ip(xml: &str) -> String {
@@ -206,8 +209,8 @@ pub struct NativeVpnBackend {
     log_rx: Option<Receiver<String>>,
     /// Handle to the relay thread (used to check liveness).
     relay_handle: Option<thread::JoinHandle<()>>,
-    /// Tunnel config for teardown.
-    tunnel_config: Option<routes::TunnelConfig>,
+    /// Signals the relay loop to shut down the tunnel.
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl NativeVpnBackend {
@@ -218,7 +221,7 @@ impl NativeVpnBackend {
             log_tx: None,
             log_rx: None,
             relay_handle: None,
-            tunnel_config: None,
+            stop_flag: None,
         }
     }
 
@@ -242,11 +245,14 @@ impl VpnBackend for NativeVpnBackend {
         let tx = log_tx;
         let profile = profile.clone();
 
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop_flag = Some(stop.clone());
+
         self.push_log(&format!("Connecting to {}…", profile.host));
 
         let handle = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                connect_inner(&profile, &tx);
+                connect_inner(&profile, &tx, stop);
             }));
             if let Err(e) = result {
                 let msg = if let Some(s) = e.downcast_ref::<String>() {
@@ -268,13 +274,26 @@ impl VpnBackend for NativeVpnBackend {
         self.state = ConnectionState::Disconnecting;
         self.push_log("Disconnecting…");
 
-        // Teardown routes if configured
-        if let Some(ref cfg) = self.tunnel_config.take() {
-            routes::teardown(cfg);
+        // Signal the relay loop to stop; it closes the TLS stream and TUN
+        // device when it exits, which also removes the per-link routes/DNS.
+        if let Some(stop) = self.stop_flag.take() {
+            stop.store(true, Ordering::Relaxed);
         }
 
-        // Kill any openfortivpn/pppd processes (belt and suspenders)
-        engine::kill_vpn_processes();
+        // Wait briefly for the relay thread to wind down (it polls every ≤10ms).
+        if let Some(handle) = self.relay_handle.take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // Still in a blocking phase (e.g. auth); it will notice the
+                // stop flag before entering the relay loop.
+                self.relay_handle = Some(handle);
+            }
+        }
 
         self.state = ConnectionState::Disconnected;
         self.push_log("Disconnected.");
@@ -343,8 +362,8 @@ impl VpnBackend for NativeVpnBackend {
 }
 
 /// The actual connection logic — runs in a background thread.
-fn connect_inner(profile: &VpnProfile, log: &Sender<String>) {
-    let result = connect_inner_impl(profile, log);
+fn connect_inner(profile: &VpnProfile, log: &Sender<String>, stop: Arc<AtomicBool>) {
+    let result = connect_inner_impl(profile, log, stop);
     match result {
         Ok(_) => {
             let _ = log.send("[engine] Tunnel closed.".into());
@@ -358,6 +377,7 @@ fn connect_inner(profile: &VpnProfile, log: &Sender<String>) {
 fn connect_inner_impl(
     profile: &VpnProfile,
     log: &Sender<String>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), VpnError> {
     let _ = log.send("[engine] TLS handshake…".into());
     let conn = gateway::connect_blocking(profile)?;
@@ -467,6 +487,13 @@ fn connect_inner_impl(
         let _ = log.send(format!("[engine] Applying {} routes + DNS ({} domains) — a privilege prompt may appear if no sudoers rule is installed…",
             vpn_routes.len(), vpn_domains.len()));
     }
+    // Disconnect requested while we were still setting up? Bail out before
+    // entering the relay loop; dropping the TUN/TLS handles tears everything down.
+    if stop.load(Ordering::Relaxed) {
+        let _ = log.send("[engine] Disconnect requested during setup — aborting.".into());
+        return Ok(());
+    }
+
     let ppp_in = pppd.writer();
     let ppp_out = pppd.reader();
 
@@ -483,6 +510,6 @@ fn connect_inner_impl(
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
     let _alive = pppd;
-    tunnel::run_relay(tls_stream, ppp_in, ppp_out, local_ip, Some(log.clone()));
+    tunnel::run_relay(tls_stream, ppp_in, ppp_out, local_ip, Some(log.clone()), stop);
     Ok(())
 }

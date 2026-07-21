@@ -6,6 +6,8 @@ use crate::engine::hdlc;
 use crate::engine::pppstate::{Phase, PppState};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const READ_BUF: usize = 8192;
@@ -16,6 +18,7 @@ pub fn run_relay(
     mut tun_r: impl Read,
     local_ip: Ipv4Addr,
     log_tx: Option<std::sync::mpsc::Sender<String>>,
+    stop: Arc<AtomicBool>,
 ) {
     let log = |msg: &str| {
         log::info!("{}", msg);
@@ -38,6 +41,10 @@ pub fn run_relay(
     let mut idle = 0u32;
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            log("Disconnect requested — closing tunnel.");
+            break;
+        }
         iter += 1;
         let mut did_work = false;
 
