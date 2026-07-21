@@ -1,9 +1,12 @@
 name: CI
 
 # Build and test on every push and pull request to the main branch.
+# Tag pushes are ignored here so tagged releases only run the release
+# workflow (release.yml) instead of building twice concurrently.
 on:
   push:
     branches: [master]
+    tags-ignore: ['**']
   pull_request:
     branches: [master]
   workflow_dispatch:
