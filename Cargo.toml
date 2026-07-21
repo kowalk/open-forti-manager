@@ -1,6 +1,6 @@
 [package]
 name = "open-forti-manager"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "GTK4 GUI front-end for openfortivpn with system tray integration, profile management, and SAML support"
 license = "MIT"
