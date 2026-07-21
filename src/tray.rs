@@ -12,6 +12,7 @@ pub struct SharedState {
     pub connected_profile: Option<String>,
     pub show_window: bool,
     pub quit_requested: bool,
+    pub force_quit: bool,
     pub quick_connect_requested: bool,
     pub disconnect_requested: bool,
     pub last_connected_profile: Option<String>,
@@ -24,6 +25,7 @@ impl SharedState {
             connected_profile: None,
             show_window: true,
             quit_requested: false,
+            force_quit: false,
             quick_connect_requested: false,
             disconnect_requested: false,
             last_connected_profile: None,
@@ -184,17 +186,10 @@ impl Tray for AppTray {
                 enabled: true,
                 visible: true,
                 activate: Box::new(|tray: &mut Self| {
-                    // Graceful VPN shutdown before quitting (SIGINT first)
-                    let _ = std::process::Command::new("pkexec")
-                        .args(["killall", "-INT", "openfortivpn"])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                    // Signal the GTK thread to show exit confirmation
                     if let Ok(mut s) = tray.state.write() {
                         s.quit_requested = true;
                     }
-                    std::process::exit(0);
                 }),
                 ..Default::default()
             }),

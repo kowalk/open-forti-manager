@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod tray;
+mod ui;
 mod vpn;
 
 use crate::app::AppWindow;
