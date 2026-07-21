@@ -1,0 +1,31 @@
+[package]
+name = "open-forti-manager"
+version = "0.1.0"
+edition = "2024"
+description = "GTK4 GUI front-end for openfortivpn with system tray integration, profile management, and SAML support"
+license = "MIT"
+repository = "https://github.com/kowalk/open-forti-manager"
+readme = "README.md"
+
+[dependencies]
+gtk4 = "0.8"
+libadwaita = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+ksni = "0.3"
+log = "0.4"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+
+[package.metadata.deb]
+maintainer = "OpenForti Manager contributors"
+depends = "openfortivpn, libgtk-4-1, libadwaita-1-0, libayatana-appindicator3-1, pkexec | polkit"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/open-forti-manager", "usr/bin/open-forti-manager", "755"],
+    ["assets/open-forti-manager.desktop", "usr/share/applications/open-forti-manager.desktop", "644"],
+]

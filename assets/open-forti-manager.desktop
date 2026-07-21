@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenForti Manager
+Comment=VPN client for Fortinet SSL-VPN (openfortivpn GUI)
+Exec=/usr/bin/open-forti-manager
+Icon=network-vpn
+Categories=Network;System;
+Terminal=false
+StartupNotify=true
