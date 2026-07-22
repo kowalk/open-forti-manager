@@ -8,4 +8,4 @@
 #
 # Applies to members of the 'sudo' group (Ubuntu/Debian administrators), who can
 # already run these commands with a password — this only removes the prompt.
-%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/bin/resolvectl *
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/sbin/ip addr *, /usr/sbin/ip link *, /usr/bin/resolvectl *

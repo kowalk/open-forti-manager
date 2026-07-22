@@ -58,7 +58,13 @@ pub struct PppState {
     pub dns2: Ipv4Addr,
     /// Outgoing PPP frames queued by the state machine.
     pub outbox: Vec<Vec<u8>>,
+    /// Bounded Configure-Request counters to prevent NAK/REJ ping-pong loops.
+    lcp_reqs: u32,
+    ipcp_reqs: u32,
 }
+
+/// Max Configure-Requests per protocol before giving up (RFC 1661 Max-Configure).
+const MAX_CONF_REQ: u32 = 10;
 
 impl PppState {
     pub fn new(local_ip: Ipv4Addr, magic: u32) -> Self {
@@ -74,6 +80,8 @@ impl PppState {
             dns1: Ipv4Addr::UNSPECIFIED,
             dns2: Ipv4Addr::UNSPECIFIED,
             outbox: Vec::new(),
+            lcp_reqs: 0,
+            ipcp_reqs: 0,
         }
     }
 
@@ -88,8 +96,15 @@ impl PppState {
         self.send_lcp_conf_req();
     }
 
-    /// Build our LCP Configure-Request (MRU + magic number).
+    /// Build our LCP Configure-Request (MRU + magic number). Bounded so a
+    /// NAK/REJ storm can't ping-pong forever — after MAX_CONF_REQ the link dies.
     fn send_lcp_conf_req(&mut self) {
+        self.lcp_reqs += 1;
+        if self.lcp_reqs > MAX_CONF_REQ {
+            log::warn!("LCP: exceeded {} Configure-Requests, giving up", MAX_CONF_REQ);
+            self.phase = Phase::Dead;
+            return;
+        }
         let id = self.next_id();
         let magic = self.magic.to_be_bytes();
         let opts = vec![
@@ -99,8 +114,14 @@ impl PppState {
         self.outbox.push(build_ppp(PROTO_LCP, CODE_CONF_REQ, id, &opts));
     }
 
-    /// Build our IPCP Configure-Request (request our IP + DNS).
+    /// Build our IPCP Configure-Request (request our IP + DNS). Bounded, as above.
     fn send_ipcp_conf_req(&mut self) {
+        self.ipcp_reqs += 1;
+        if self.ipcp_reqs > MAX_CONF_REQ {
+            log::warn!("IPCP: exceeded {} Configure-Requests, giving up", MAX_CONF_REQ);
+            self.phase = Phase::Dead;
+            return;
+        }
         let id = self.next_id();
         let ip = self.local_ip.octets();
         let opts = vec![

@@ -402,10 +402,7 @@ fn connect_inner_impl(
         use std::io::Write;
         tls_stream.write_all(req.as_bytes()).map_err(|e| VpnError::Auth(format!("saml auth_id: {}", e)))?;
         tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
-        let mut buf = vec![0u8; 65536];
-        use std::io::Read;
-        let n = tls_stream.read(&mut buf).map_err(|e| VpnError::Auth(format!("saml auth_id read: {}", e)))?;
-        let resp = String::from_utf8_lossy(&buf[..n]);
+        let resp = auth::read_http_response(&mut tls_stream)?;
         auth::extract_cookie(&resp)
             .ok_or_else(|| VpnError::Auth("No SVPNCOOKIE after SAML exchange".into()))?
     } else {

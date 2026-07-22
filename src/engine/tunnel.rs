@@ -40,9 +40,21 @@ pub fn run_relay(
     let mut announced_network = false;
     let mut idle = 0u32;
 
+    // Negotiation must reach the NETWORK phase within this window, or we abort
+    // instead of showing "Connecting…" forever when the gateway stalls.
+    const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(25);
+    let started = SystemTime::now();
+
     loop {
         if stop.load(Ordering::Relaxed) {
             log("Disconnect requested — closing tunnel.");
+            break;
+        }
+        // Enforce the PPP negotiation deadline (only until NETWORK is reached).
+        if ppp.phase != Phase::Network
+            && started.elapsed().map(|e| e > NEGOTIATION_TIMEOUT).unwrap_or(false)
+        {
+            log("PPP negotiation timed out — the gateway did not complete LCP/IPCP. Aborting.");
             break;
         }
         iter += 1;

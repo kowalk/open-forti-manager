@@ -10,6 +10,85 @@ use crate::config::VpnProfile;
 use crate::engine::VpnError;
 use std::io::{Read, Write};
 
+const MAX_HTTP_RESPONSE: usize = 8 * 1024 * 1024;
+
+/// Read one complete HTTP response from a (blocking) stream.
+///
+/// A single `read()` is not enough: responses split across TCP segments / TLS
+/// records would otherwise be truncated, and — on a keep-alive connection —
+/// leftover bytes would corrupt the *next* response. This reads until the
+/// headers are complete, then consumes the body per `Content-Length` or the
+/// chunked terminator, so every exchange stays framed correctly.
+pub(crate) fn read_http_response(stream: &mut impl Read) -> Result<String, VpnError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+
+    // 1) Read until the end of headers (\r\n\r\n).
+    let header_end = loop {
+        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(&mut tmp)
+            .map_err(|e| VpnError::Auth(format!("read response: {}", e)))?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(VpnError::Auth("empty response from gateway".into()));
+            }
+            break buf.len(); // connection closed mid-headers; return what we have
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_HTTP_RESPONSE {
+            return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
+        }
+    };
+
+    // 2) Read the body to completion.
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+    if let Some(clen) = content_length(&headers) {
+        while buf.len() - header_end < clen {
+            let n = stream.read(&mut tmp)
+                .map_err(|e| VpnError::Auth(format!("read body: {}", e)))?;
+            if n == 0 { break; }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > MAX_HTTP_RESPONSE {
+                return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
+            }
+        }
+    } else if headers.contains("transfer-encoding: chunked") {
+        // Read until the terminating zero-length chunk "0\r\n\r\n".
+        while !ends_with(&buf, b"0\r\n\r\n") && !ends_with(&buf, b"\r\n0\r\n\r\n") {
+            let n = stream.read(&mut tmp)
+                .map_err(|e| VpnError::Auth(format!("read chunked body: {}", e)))?;
+            if n == 0 { break; }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > MAX_HTTP_RESPONSE {
+                return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
+            }
+        }
+    }
+    // else: no body indicated (e.g. redirect with Content-Length: 0) — done.
+
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Parse the Content-Length value from lowercased header text.
+fn content_length(headers_lower: &str) -> Option<usize> {
+    for line in headers_lower.lines() {
+        if let Some(rest) = line.strip_prefix("content-length:") {
+            return rest.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
+    haystack.len() >= suffix.len() && &haystack[haystack.len() - suffix.len()..] == suffix
+}
+
 /// Result of a successful authentication.
 pub struct AuthResult {
     /// The SVPNCOOKIE session token from the gateway.
@@ -65,17 +144,14 @@ fn authenticate_password(
         .map_err(|e| VpnError::Auth(format!("login POST failed: {}", e)))?;
     tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
 
-    let mut buf = vec![0u8; 65536];
-    let n = tls_stream.read(&mut buf)
-        .map_err(|e| VpnError::Auth(format!("read response failed: {}", e)))?;
-    let response = String::from_utf8_lossy(&buf[..n]);
+    let response = read_http_response(tls_stream)?;
 
     let cookie = extract_cookie(&response)
         .ok_or_else(|| VpnError::Auth("No SVPNCOOKIE in response".into()))?;
 
     log::info!("Got SVPNCOOKIE: {:.16}...", &cookie);
 
-    Ok(AuthResult { cookie, body: response.to_string() })
+    Ok(AuthResult { cookie, body: response })
 }
 
 /// SAML-based login (two-phase):
@@ -161,12 +237,9 @@ pub fn fetch_config(
         .map_err(|e| VpnError::Auth(format!("config request: {}", e)))?;
     tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
 
-    let mut buf = vec![0u8; 65536];
-    let n = tls_stream.read(&mut buf)
-        .map_err(|e| VpnError::Auth(format!("config read: {}", e)))?;
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    let resp = read_http_response(tls_stream)?;
 
-    // Extract body
+    // Extract body (may be chunked — callers tolerate chunk-size markers).
     let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     log::info!("Got VPN config ({} bytes)", body.len());
     Ok(body)
@@ -190,8 +263,8 @@ pub fn allocate_tunnel(
     tls_stream.write_all(req.as_bytes())
         .map_err(|e| VpnError::Auth(format!("index request: {}", e)))?;
     tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
-    let mut buf = [0u8; 8192];
-    tls_stream.read(&mut buf).map_err(|e| VpnError::Auth(format!("index read: {}", e)))?;
+    // Consume the full response so the keep-alive stream stays framed.
+    read_http_response(tls_stream)?;
 
     // Step 2: GET /remote/fortisslvpn — allocates the tunnel slot
     let req = format!(
@@ -201,8 +274,7 @@ pub fn allocate_tunnel(
     tls_stream.write_all(req.as_bytes())
         .map_err(|e| VpnError::Auth(format!("alloc request: {}", e)))?;
     tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
-    let n = tls_stream.read(&mut buf).map_err(|e| VpnError::Auth(format!("alloc read: {}", e)))?;
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    let resp = read_http_response(tls_stream)?;
 
     if resp.contains("200") {
         log::info!("Tunnel slot allocated");
@@ -222,8 +294,7 @@ pub fn allocate_tunnel(
         tls_stream.write_all(req.as_bytes())
             .map_err(|e| VpnError::Auth(format!("redirect request: {}", e)))?;
         tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
-        let n = tls_stream.read(&mut buf).map_err(|e| VpnError::Auth(format!("redirect read: {}", e)))?;
-        let resp2 = String::from_utf8_lossy(&buf[..n]);
+        let resp2 = read_http_response(tls_stream)?;
         if resp2.contains("200") {
             log::info!("Tunnel slot allocated (after redirect)");
             Ok(())
