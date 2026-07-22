@@ -15,8 +15,9 @@ implemented in Rust.
 - **VPN profile management** — create, edit, and save multiple connection profiles
 - **SAML login support** — auto-opens the authentication URL in your browser and
   captures the callback locally
-- **Certificate trust management** — configure CA bundles, user certificates, and
-  trusted SHA256 digests (`--trusted-cert`)
+- **Certificate handling** — custom CA bundles, **trusted-cert pinning** by SHA256
+  digest (works with self-signed FortiGate certs, like `--trusted-cert`), and
+  **client-certificate (mTLS)** auth via a user cert + key
 - **Split tunneling & split DNS** — installs the gateway's routes and routes the
   gateway's DNS domains (`*.corp.example`) to the VPN resolvers automatically
 - **System tray integration** — background mode with a status indicator icon
@@ -88,8 +89,12 @@ is scoped to the route-table / resolved commands only, *not* a root shell:
 
 ```
 # /etc/sudoers.d/open-forti-manager  (mode 0440)
-%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/bin/resolvectl *
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/sbin/ip addr *, /usr/sbin/ip link *, /usr/bin/resolvectl *
 ```
+
+(The interface IP is assigned in-process via `ioctl` using `CAP_NET_ADMIN`, so
+the `ip addr` / `ip link` entries are only a fallback for setups without the
+capability.)
 
 Without any such rule, everything still works — you just get one `pkexec`
 prompt each time you connect.
@@ -102,7 +107,7 @@ prompt each time you connect.
 | `libadwaita-1-0` | Modern GNOME widgets |
 | `libayatana-appindicator3-1` | System tray support |
 | `libcap2-bin` | Provides `setcap` for granting `CAP_NET_ADMIN` |
-| `pkexec` (from `polkit`) | Privilege escalation for teardown helpers |
+| `pkexec` (from `polkit`) | Route/DNS elevation fallback when no sudoers rule is installed |
 
 > Note: `openfortivpn` is **no longer required** — the VPN engine is native.
 
@@ -161,9 +166,11 @@ sudo dpkg -i ~/Downloads/open-forti-manager_*.deb
 sudo apt install -f  # Fix any missing dependencies
 ```
 
-The package's post-install script automatically runs
-`setcap cap_net_admin+eip /usr/bin/open-forti-manager`, so the app can create the
-TUN interface without being run as root.
+The package's post-install script automatically:
+- runs `setcap cap_net_admin+eip /usr/bin/open-forti-manager`, so the app can
+  create the TUN interface without being run as root; and
+- installs the narrow sudoers rule (after validating it with `visudo`), so
+  routes/DNS apply without a prompt. It is removed again on uninstall.
 
 ## Configuration
 
