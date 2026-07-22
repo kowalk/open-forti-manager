@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// A single VPN connection profile containing all settings
-/// that map to openfortivpn CLI options.
+/// A single VPN connection profile consumed by the native SSL-VPN engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnProfile {
     /// Display name for this profile
@@ -59,84 +58,6 @@ impl VpnProfile {
         }
     }
 
-    /// Build the command-line arguments for openfortivpn.
-    pub fn to_args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-
-        // Host[:port]
-        match self.port {
-            Some(port) => args.push(format!("{}:{}", self.host, port)),
-            None => args.push(self.host.clone()),
-        }
-
-        // Username
-        args.push("-u".to_string());
-        args.push(self.username.clone());
-
-        // Password (if provided)
-        if let Some(ref pwd) = self.password {
-            args.push("-p".to_string());
-            args.push(pwd.clone());
-        }
-
-        // CA file
-        if let Some(ref ca) = self.ca_file {
-            args.push("--ca-file".to_string());
-            args.push(ca.clone());
-        }
-
-        // User certificate
-        if let Some(ref cert) = self.user_cert {
-            args.push("--user-cert".to_string());
-            args.push(cert.clone());
-        }
-
-        // User key
-        if let Some(ref key) = self.user_key {
-            args.push("--user-key".to_string());
-            args.push(key.clone());
-        }
-
-        // Trusted cert digest
-        if let Some(ref tc) = self.trusted_cert {
-            args.push("--trusted-cert".to_string());
-            args.push(tc.clone());
-        }
-
-        // SAML login
-        if self.saml_login == Some(true) {
-            match self.saml_port {
-                Some(port) => args.push(format!("--saml-login={}", port)),
-                None => args.push("--saml-login".to_string()),
-            }
-        }
-
-        // DNS
-        if let Some(dns) = self.set_dns {
-            args.push(format!("--set-dns={}", if dns { "1" } else { "0" }));
-        }
-
-        // Routes
-        if let Some(routes) = self.set_routes {
-            args.push(format!("--set-routes={}", if routes { "1" } else { "0" }));
-        }
-
-        // Half-internet routes
-        if let Some(half) = self.half_internet_routes {
-            args.push(format!(
-                "--half-internet-routes={}",
-                if half { "1" } else { "0" }
-            ));
-        }
-
-        // Realm
-        if let Some(ref realm) = self.realm {
-            args.push("--realm".to_string());
-            args.push(realm.clone());
-        }
-
-        args
-    }
 }
 
 /// Global application settings.

@@ -1,5 +1,7 @@
-//! Native TUN interface — replaces external pppd.
-//! No privilege escalation needed if the binary has CAP_NET_ADMIN set.
+//! Shared TUN device handle carrying PPP frames.
+//!
+//! This is the native data path — there is no external `pppd`; the app owns
+//! the TUN device directly. Creating it needs root or CAP_NET_ADMIN.
 
 use crate::engine::tun::TunDevice;
 use crate::engine::VpnError;
@@ -7,13 +9,13 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 /// Shared TUN device handle (supports concurrent read/write via Mutex).
-pub struct PppDaemon {
+pub struct TunHandle {
     tun: Arc<Mutex<TunDevice>>,
 }
 
-impl PppDaemon {
-    /// Create a TUN device. Needs root or CAP_NET_ADMIN.
-    pub fn spawn() -> Result<Self, VpnError> {
+impl TunHandle {
+    /// Create and open a TUN device. Needs root or CAP_NET_ADMIN.
+    pub fn open() -> Result<Self, VpnError> {
         let tun = TunDevice::create("vpn%d")?;
         log::info!("TUN device {} created", tun.name());
         Ok(Self { tun: Arc::new(Mutex::new(tun)) })
@@ -36,8 +38,6 @@ impl PppDaemon {
     pub fn iface_name(&self) -> String {
         self.tun.lock().unwrap().name().to_string()
     }
-
-    pub fn is_alive(&self) -> bool { true }
 }
 
 pub struct TunReader { inner: Arc<Mutex<TunDevice>> }

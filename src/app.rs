@@ -137,12 +137,6 @@ impl AppWindow {
             profiles_tab,
         }));
 
-        // Detect existing VPN connection
-        if crate::vpn::VpnManager::is_running_global() {
-            vpn.borrow_mut().set_state(ConnectionState::Connected);
-            log::info!("Detected existing VPN connection");
-        }
-
         // Load initial data
         slf.borrow_mut().refresh_profile_list();
         {

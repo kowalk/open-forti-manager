@@ -1,10 +1,8 @@
-//! Native Rust openfortivpn engine — TLS, auth, tunnel relay.
+//! Native Fortinet SSL-VPN engine — TLS, auth, PPP/IPCP, tunnel relay.
 //!
-//! This module replaces the external `openfortivpn` binary with a pure-Rust
-//! implementation of the Fortinet SSL-VPN protocol.
-//!
-//! Note: This module is not yet wired into the main application.
-//! The `#[allow(dead_code)]` attributes will be removed during integration.
+//! A pure-Rust implementation of the Fortinet SSL-VPN protocol. It is the sole
+//! VPN backend (`NativeVpnBackend`); no external `openfortivpn` binary or
+//! `pppd` process is used.
 
 #![allow(dead_code)]
 
@@ -62,28 +60,3 @@ impl std::fmt::Display for VpnError {
 }
 
 impl std::error::Error for VpnError {}
-
-/// Kill any running openfortivpn/pppd processes (shared with legacy backend).
-pub fn kill_vpn_processes() {
-    let mut pids: Vec<String> = Vec::new();
-    for proc in &["openfortivpn", "pppd"] {
-        if let Ok(out) = std::process::Command::new("pgrep").arg(proc).output() {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                for pid in s.lines() { pids.push(pid.to_string()); }
-            }
-        }
-    }
-    if pids.is_empty() { return; }
-
-    let mut args: Vec<String> = vec!["sh".into(), "-c".into()];
-    let pids_str = pids.join(" ");
-    args.push(format!("kill -INT {}; sleep 0.5; kill -KILL {}", pids_str, pids_str));
-
-    let _ = std::process::Command::new("pkexec")
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut c| c.wait());
-}

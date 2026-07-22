@@ -332,20 +332,6 @@ impl VpnBackend for NativeVpnBackend {
         &self.state
     }
 
-    fn set_state(&mut self, s: ConnectionState) {
-        self.state = s;
-    }
-
-    fn is_running_global() -> bool {
-        std::process::Command::new("pgrep")
-            .args(["openfortivpn"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
     fn drain_log(&mut self) -> Vec<String> {
         let mut new = Vec::new();
         if let Some(ref rx) = self.log_rx {
@@ -429,18 +415,18 @@ fn connect_inner_impl(
     auth::start_tunnel(&mut tls_stream, profile, &cookie)?;
 
     let _ = log.send("[engine] Creating TUN interface…".into());
-    let pppd = ppp::PppDaemon::spawn()?;
-    let _ = log.send(format!("[engine] TUN {} ready", pppd.iface_name()));
+    let tun = ppp::TunHandle::open()?;
+    let _ = log.send(format!("[engine] TUN {} ready", tun.iface_name()));
 
     // Assign IP and set up routes
-    if let Err(e) = pppd.configure(&vpn_ip) {
+    if let Err(e) = tun.configure(&vpn_ip) {
         let _ = log.send(format!("[engine] WARNING: Failed to set IP: {}", e));
     }
-    let _ = log.send(format!("[engine] TUN {} configured with {}", pppd.iface_name(), vpn_ip));
+    let _ = log.send(format!("[engine] TUN {} configured with {}", tun.iface_name(), vpn_ip));
 
     // Build the split-tunnel route + DNS commands as an explicit argv list, so
     // each can be matched by the narrow packaged sudoers rule (no root shell).
-    let ifname = pppd.iface_name();
+    let ifname = tun.iface_name();
     if !vpn_routes.is_empty() || !vpn_dns.is_empty() {
         let mut commands: Vec<Vec<String>> = Vec::new();
         for (net, mask) in &vpn_routes {
@@ -491,8 +477,8 @@ fn connect_inner_impl(
         return Ok(());
     }
 
-    let ppp_in = pppd.writer();
-    let ppp_out = pppd.reader();
+    let ppp_in = tun.writer();
+    let ppp_out = tun.reader();
 
     // Set TLS non-blocking for polling
     use std::os::unix::io::AsRawFd;
@@ -506,7 +492,7 @@ fn connect_inner_impl(
         .parse()
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-    let _alive = pppd;
+    let _alive = tun;
     tunnel::run_relay(tls_stream, ppp_in, ppp_out, local_ip, Some(log.clone()), stop);
     Ok(())
 }

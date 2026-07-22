@@ -1,4 +1,4 @@
-//! OpenForti Manager — GTK4 + libadwaita GUI for openfortivpn.
+//! OpenForti Manager — native Fortinet SSL-VPN client with a GTK4 + libadwaita GUI.
 
 mod app;
 mod config;
