@@ -349,16 +349,28 @@ impl AppWindow {
             drop(s);
 
             if raise {
-                // Bring the window to the front, even when it's already open but
-                // buried under another window. A plain present() does not reliably
-                // restack an already-mapped window on some compositors (focus-
-                // stealing prevention), so cycle visibility to force a fresh map,
-                // which the compositor places on top and focuses.
-                if self.window.is_visible() {
-                    self.window.set_visible(false);
-                }
+                // Ensure the window is mapped (needed so wmctrl can find it),
+                // but do NOT call present() — a present() from the tray-triggered
+                // poll has no user-interaction timestamp, so mutter defers it and
+                // only pops an "app is ready" notification instead of raising.
+                // wmctrl's legacy _NET_ACTIVE_WINDOW request IS honored by mutter
+                // (same path as clicking that notification), so it does the actual
+                // raise + focus. Runs off-thread; no-ops if wmctrl isn't installed.
                 self.window.set_visible(true);
-                self.window.present();
+                let title = self.window.title().map(|s| s.to_string())
+                    .unwrap_or_else(|| "OpenForti Manager".to_string());
+                std::thread::spawn(move || {
+                    // Retry: the window may still be mapping when we first try.
+                    for delay in [120u64, 200, 400] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        let ok = std::process::Command::new("wmctrl")
+                            .args(["-a", &title])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        if ok { break; }
+                    }
+                });
             } else if !show && self.window.is_visible() {
                 // Left-click toggle requested hide.
                 self.window.set_visible(false);

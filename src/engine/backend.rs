@@ -7,7 +7,7 @@ use crate::engine::{auth, gateway, ppp, tunnel, VpnError};
 use crate::vpn::{ConnectionState, VpnBackend};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -231,6 +231,10 @@ pub struct NativeVpnBackend {
     relay_handle: Option<thread::JoinHandle<()>>,
     /// Signals the relay loop to shut down the tunnel.
     stop_flag: Option<Arc<AtomicBool>>,
+    /// Profile of the active session (for logout on disconnect).
+    active_profile: Option<VpnProfile>,
+    /// SVPNCOOKIE of the active session, filled by the relay thread once known.
+    session_cookie: Arc<Mutex<Option<String>>>,
 }
 
 impl NativeVpnBackend {
@@ -242,6 +246,8 @@ impl NativeVpnBackend {
             log_rx: None,
             relay_handle: None,
             stop_flag: None,
+            active_profile: None,
+            session_cookie: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -249,6 +255,30 @@ impl NativeVpnBackend {
         self.log.push(msg.to_string());
         if let Some(ref tx) = self.log_tx {
             let _ = tx.send(msg.to_string());
+        }
+    }
+
+    /// Release the gateway session (best-effort, in the background): open a
+    /// fresh TLS connection and `GET /remote/logout`, so an immediate reconnect
+    /// isn't refused while the gateway still holds the old session. Idempotent —
+    /// clears the stored session so it runs at most once per connection.
+    fn logout_session(&mut self) {
+        let cookie = self.session_cookie.lock().ok().and_then(|mut c| c.take());
+        let profile = self.active_profile.take();
+        if let (Some(profile), Some(cookie)) = (profile, cookie) {
+            let tx = self.log_tx.clone();
+            thread::spawn(move || {
+                match gateway::connect_blocking(&profile) {
+                    Ok(conn) => {
+                        let mut tls = conn.tls_stream;
+                        auth::logout(&mut tls, &profile, &cookie);
+                        if let Some(tx) = tx {
+                            let _ = tx.send("[engine] Logged out of gateway.".into());
+                        }
+                    }
+                    Err(e) => log::warn!("logout: could not reconnect to gateway: {}", e),
+                }
+            });
         }
     }
 }
@@ -264,6 +294,11 @@ impl VpnBackend for NativeVpnBackend {
 
         let tx = log_tx;
         let profile = profile.clone();
+        self.active_profile = Some(profile.clone());
+
+        // Fresh cookie slot for this session; the relay thread fills it.
+        let cookie_slot = Arc::new(Mutex::new(None));
+        self.session_cookie = cookie_slot.clone();
 
         let stop = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop.clone());
@@ -272,7 +307,7 @@ impl VpnBackend for NativeVpnBackend {
 
         let handle = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                connect_inner(&profile, &tx, stop);
+                connect_inner(&profile, &tx, stop, cookie_slot);
             }));
             if let Err(e) = result {
                 let msg = if let Some(s) = e.downcast_ref::<String>() {
@@ -315,36 +350,48 @@ impl VpnBackend for NativeVpnBackend {
             }
         }
 
+        self.logout_session();
+
         self.state = ConnectionState::Disconnected;
         self.push_log("Disconnected.");
         Ok(())
     }
 
     fn check_status(&mut self) {
-        // Check relay thread liveness
-        if let Some(ref handle) = self.relay_handle {
-            if handle.is_finished() {
-                self.relay_handle = None;
-                if self.state == ConnectionState::Connected {
-                    self.state = ConnectionState::Disconnected;
-                    self.push_log("Tunnel closed.");
-                } else if self.state == ConnectionState::Connecting {
-                    // Thread finished without sending "Tunnel UP!" — check for errors
-                    if !self.log.iter().any(|l| l.contains("Tunnel UP!") || l.contains("ERROR:")) {
-                        self.state = ConnectionState::Error("Connection failed (no output)".into());
-                    }
-                }
+        // A disconnect (manual or already-finished) is authoritative — never
+        // revert it from log/thread state.
+        if matches!(self.state, ConnectionState::Disconnecting | ConnectionState::Disconnected) {
+            return;
+        }
+
+        // While connecting, promote based on log signals: an error wins,
+        // otherwise "Tunnel UP!" means the tunnel reached the relay loop.
+        if self.state == ConnectionState::Connecting {
+            if let Some(err) = self.log.iter().find(|l| l.contains("ERROR:") || l.contains("PANIC:")) {
+                self.state = ConnectionState::Error(err.clone());
+            } else if self.log.iter().any(|l| l.contains("Tunnel UP!")) {
+                self.state = ConnectionState::Connected;
             }
         }
 
-        // Scan already-drained log for state transitions
-        for line in &self.log {
-            if line.contains("Tunnel UP!") && self.state == ConnectionState::Connecting {
-                self.state = ConnectionState::Connected;
+        // The relay thread ending is the authoritative "tunnel is down" signal.
+        // Handle it AFTER the promotion above so a fast connect→fail can't get
+        // stuck showing "Connected".
+        let relay_finished = self.relay_handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+        if relay_finished {
+            self.relay_handle = None;
+            if let Some(err) = self.log.iter().rev().find(|l| l.contains("ERROR:") || l.contains("PANIC:")).cloned() {
+                self.state = ConnectionState::Error(err);
+            } else {
+                // Only log "Tunnel closed." once, on the transition.
+                if self.state != ConnectionState::Disconnected {
+                    self.push_log("Tunnel closed.");
+                }
+                self.state = ConnectionState::Disconnected;
             }
-            if line.contains("ERROR:") && self.state == ConnectionState::Connecting {
-                self.state = ConnectionState::Error(line.clone());
-            }
+            // The tunnel dropped on its own — release the gateway session so a
+            // reconnect isn't refused while the old session lingers.
+            self.logout_session();
         }
     }
 
@@ -368,8 +415,13 @@ impl VpnBackend for NativeVpnBackend {
 }
 
 /// The actual connection logic — runs in a background thread.
-fn connect_inner(profile: &VpnProfile, log: &Sender<String>, stop: Arc<AtomicBool>) {
-    let result = connect_inner_impl(profile, log, stop);
+fn connect_inner(
+    profile: &VpnProfile,
+    log: &Sender<String>,
+    stop: Arc<AtomicBool>,
+    cookie_slot: Arc<Mutex<Option<String>>>,
+) {
+    let result = connect_inner_impl(profile, log, stop, cookie_slot);
     match result {
         Ok(_) => {
             let _ = log.send("[engine] Tunnel closed.".into());
@@ -384,6 +436,7 @@ fn connect_inner_impl(
     profile: &VpnProfile,
     log: &Sender<String>,
     stop: Arc<AtomicBool>,
+    cookie_slot: Arc<Mutex<Option<String>>>,
 ) -> Result<(), VpnError> {
     let _ = log.send("[engine] TLS handshake…".into());
     let conn = gateway::connect_blocking(profile)?;
@@ -414,6 +467,10 @@ fn connect_inner_impl(
     } else {
         auth_result.cookie
     };
+    // Publish the cookie so disconnect() can log out this session cleanly.
+    if let Ok(mut slot) = cookie_slot.lock() {
+        *slot = Some(cookie.clone());
+    }
     let _ = log.send("[engine] Got session cookie.".into());
 
     let _ = log.send("[engine] Allocating tunnel slot…".into());

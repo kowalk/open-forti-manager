@@ -1,6 +1,6 @@
 [package]
 name = "open-forti-manager"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 description = "Native Fortinet SSL-VPN client for Linux with a GTK4 GUI — pure-Rust TLS, SAML, and PPP/IPCP engine (no openfortivpn or pppd), system tray, and profile management"
 license = "MIT"
@@ -29,6 +29,9 @@ libc = "0.2"
 [package.metadata.deb]
 maintainer = "OpenForti Manager contributors"
 depends = "libgtk-4-1, libadwaita-1-0, libayatana-appindicator3-1, libcap2-bin, pkexec | polkit"
+# wmctrl lets the tray "Show Window" reliably raise/focus the window on X11
+# (mutter focus-stealing prevention ignores a plain present()). Optional.
+recommends = "wmctrl"
 section = "net"
 priority = "optional"
 maintainer-scripts = "debian/"
