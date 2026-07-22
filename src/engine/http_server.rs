@@ -32,16 +32,22 @@ pub fn wait_for_saml_callback(port: u16) -> Result<String, VpnError> {
 
                 let id = extract_session_id(&line);
 
-                // Send a response back to the browser
-                let response = if id.is_some() {
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-                     <html><body><h1>SAML login successful</h1>\
-                     <p>You can close this window.</p></body></html>"
+                // Send a response back to the browser.
+                let (status, body) = if id.is_some() {
+                    ("200 OK", success_page())
                 } else {
-                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
-                     <html><body><h1>Error</h1><p>No session ID found.</p></body></html>"
+                    ("400 Bad Request",
+                     "<html><body><h1>Error</h1><p>No session ID found.</p></body></html>".to_string())
                 };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {len}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    len = body.len(),
+                );
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
 
                 if let Some(id) = id {
                     return Ok(id);
@@ -52,6 +58,27 @@ pub fn wait_for_saml_callback(port: u16) -> Result<String, VpnError> {
     }
 
     Err(VpnError::Auth("SAML callback timed out".into()))
+}
+
+/// Success page shown in the browser after the SAML callback. Tries to close
+/// the tab automatically; browsers that refuse to close a tab not opened by a
+/// script fall back to a clear "you can close this tab" message.
+fn success_page() -> String {
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>VPN login</title>\
+     <style>body{font-family:system-ui,sans-serif;text-align:center;padding:3rem;color:#222}\
+     h1{color:#1a7f37}p{color:#555}</style></head>\
+     <body>\
+     <h1>&#10003; VPN login successful</h1>\
+     <p id=\"m\">This tab will close automatically&hellip;</p>\
+     <script>\
+     (function(){\
+       function bye(){try{window.open('','_self');window.close();}catch(e){}}\
+       bye();\
+       setTimeout(bye,200);\
+       setTimeout(function(){document.getElementById('m').textContent='You can close this tab now.';},600);\
+     })();\
+     </script>\
+     </body></html>".to_string()
 }
 
 /// Extract the SAML session ID from the HTTP request line.
