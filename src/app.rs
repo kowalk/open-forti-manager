@@ -245,6 +245,27 @@ impl AppWindow {
         }
 
         window.present();
+
+        // Auto-connect on startup, if a profile is configured for it.
+        {
+            let auto = slf.borrow().config.borrow().settings.auto_connect_profile.clone();
+            if let Some(name) = auto {
+                let found = {
+                    let this = slf.borrow();
+                    let cfg = this.config.borrow();
+                    cfg.profiles.iter().position(|p| p.name == name)
+                        .map(|i| (i, cfg.profiles[i].clone()))
+                };
+                if let Some((idx, profile)) = found {
+                    log::info!("Auto-connecting to profile '{}'", name);
+                    let this = slf.borrow();
+                    this.connection.profile_combo.set_selected(idx as u32);
+                    let _ = this.vpn.borrow_mut().connect(&profile);
+                    this.update_status_ui();
+                }
+            }
+        }
+
         slf
     }
 
@@ -485,6 +506,7 @@ impl AppWindow {
         self.profiles.refresh_list(&cfg.profiles);
         let names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
         self.connection.set_profiles(&names);
+        self.settings.set_profiles(&names);
     }
 
     fn on_profile_selected(&mut self, idx: usize) {

@@ -201,6 +201,26 @@ fn apply_network_config(commands: &[Vec<String>]) -> (&'static str, bool, String
     }
 }
 
+/// Determine the current physical route to `ip` (before any tunnel routes are
+/// added) by parsing `ip route get`. Returns `(via, dev)` where `via` is the
+/// next-hop gateway (None for a directly-connected subnet). Read-only, no sudo.
+fn physical_route_to(ip: &str) -> Option<(Option<String>, String)> {
+    let out = std::process::Command::new(IP_BIN)
+        .args(["route", "get", ip])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // e.g. "88.217.250.207 via 192.168.10.1 dev wlp0s20f3 src ..." or
+    //      "10.1.2.3 dev eth0 src 10.1.2.4"
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let via = tokens.iter().position(|&t| t == "via").and_then(|i| tokens.get(i + 1)).map(|s| s.to_string());
+    let dev = tokens.iter().position(|&t| t == "dev").and_then(|i| tokens.get(i + 1)).map(|s| s.to_string())?;
+    Some((via, dev))
+}
+
 /// Native VPN backend that speaks the Fortinet SSL-VPN protocol directly.
 pub struct NativeVpnBackend {
     state: ConnectionState,
@@ -367,7 +387,7 @@ fn connect_inner_impl(
 ) -> Result<(), VpnError> {
     let _ = log.send("[engine] TLS handshake…".into());
     let conn = gateway::connect_blocking(profile)?;
-    let (mut tls_stream, _gateway) = (conn.tls_stream, conn.gateway);
+    let (mut tls_stream, gateway_addr) = (conn.tls_stream, conn.gateway);
     let _ = log.send("[engine] TLS established.".into());
 
     let _ = log.send("[engine] Authenticating…".into());
@@ -424,36 +444,75 @@ fn connect_inner_impl(
     }
     let _ = log.send(format!("[engine] TUN {} configured with {}", tun.iface_name(), vpn_ip));
 
-    // Build the split-tunnel route + DNS commands as an explicit argv list, so
-    // each can be matched by the narrow packaged sudoers rule (no root shell).
+    // Honor the profile's Set-DNS / Set-Routes / Half-Internet options.
+    // "Default" (None) keeps the historical always-on behavior; only an explicit
+    // "No" disables, and Half-Internet is opt-in.
+    let want_routes = profile.set_routes != Some(false);
+    let want_dns = profile.set_dns != Some(false);
+    let half_internet = profile.half_internet_routes == Some(true);
+
+    // Build the route + DNS commands as an explicit argv list, so each matches
+    // the narrow packaged sudoers rule (no root shell).
     let ifname = tun.iface_name();
-    if !vpn_routes.is_empty() || !vpn_dns.is_empty() {
-        let mut commands: Vec<Vec<String>> = Vec::new();
-        for (net, mask) in &vpn_routes {
-            commands.push(vec![
-                IP_BIN.into(), "route".into(), "add".into(),
-                format!("{}/{}", net, mask), "dev".into(), ifname.clone(),
-            ]);
-        }
-        if !vpn_dns.is_empty() {
-            let mut dns_cmd = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.clone()];
-            dns_cmd.extend(vpn_dns.iter().cloned());
-            commands.push(dns_cmd);
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    let mut route_count = 0usize;
 
-            // Route the split-DNS domains to the VPN DNS servers. The '~' prefix
-            // marks them as routing-only domains so *.domain lookups use vpn0's DNS.
-            // Fall back to a wildcard so all lookups prefer the VPN DNS if the
-            // gateway didn't advertise any split-DNS domains.
-            let domain_args: Vec<String> = if vpn_domains.is_empty() {
-                vec!["~.".to_string()]
+    if want_routes {
+        if half_internet {
+            // Full tunnel via two /1 routes (more specific than the default /0,
+            // so they win without replacing it). First pin a host route to the
+            // VPN gateway over the *physical* path, otherwise the /1 routes would
+            // capture the tunnel's own TLS connection and break it.
+            let gw_ip = gateway_addr.ip().to_string();
+            if let Some((via, dev)) = physical_route_to(&gw_ip) {
+                let mut cmd = vec![IP_BIN.into(), "route".into(), "add".into(), format!("{}/32", gw_ip)];
+                if let Some(via) = via { cmd.push("via".into()); cmd.push(via); }
+                cmd.push("dev".into()); cmd.push(dev);
+                commands.push(cmd);
+                let _ = log.send(format!("[engine] Half-internet: pinned gateway {} to physical route", gw_ip));
             } else {
-                vpn_domains.iter().map(|d| format!("~{}", d)).collect()
-            };
-            let mut dom_cmd = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.clone()];
-            dom_cmd.extend(domain_args);
-            commands.push(dom_cmd);
+                let _ = log.send(format!(
+                    "[engine] WARNING: could not determine physical route to gateway {} — half-internet may drop the tunnel", gw_ip));
+            }
+            for net in ["0.0.0.0/1", "128.0.0.0/1"] {
+                commands.push(vec![IP_BIN.into(), "route".into(), "add".into(),
+                    net.into(), "dev".into(), ifname.clone()]);
+                route_count += 1;
+            }
+        } else {
+            for (net, mask) in &vpn_routes {
+                commands.push(vec![
+                    IP_BIN.into(), "route".into(), "add".into(),
+                    format!("{}/{}", net, mask), "dev".into(), ifname.clone(),
+                ]);
+                route_count += 1;
+            }
         }
+    }
 
+    if want_dns && !vpn_dns.is_empty() {
+        let mut dns_cmd = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.clone()];
+        dns_cmd.extend(vpn_dns.iter().cloned());
+        commands.push(dns_cmd);
+
+        // Route the split-DNS domains to the VPN DNS servers. The '~' prefix
+        // marks them as routing-only domains so *.domain lookups use vpn0's DNS.
+        // Fall back to a wildcard so all lookups prefer the VPN DNS if the
+        // gateway didn't advertise any split-DNS domains.
+        let domain_args: Vec<String> = if vpn_domains.is_empty() {
+            vec!["~.".to_string()]
+        } else {
+            vpn_domains.iter().map(|d| format!("~{}", d)).collect()
+        };
+        let mut dom_cmd = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.clone()];
+        dom_cmd.extend(domain_args);
+        commands.push(dom_cmd);
+    }
+
+    if commands.is_empty() {
+        let _ = log.send("[engine] Skipping route/DNS setup (disabled in profile).".into());
+    } else {
+        let applied_dns = want_dns && !vpn_dns.is_empty();
         let log2 = log.clone();
         std::thread::spawn(move || {
             let (method, ok, detail) = apply_network_config(&commands);
@@ -467,8 +526,12 @@ fn connect_inner_impl(
                 ));
             }
         });
-        let _ = log.send(format!("[engine] Applying {} routes + DNS ({} domains) — a privilege prompt may appear if no sudoers rule is installed…",
-            vpn_routes.len(), vpn_domains.len()));
+        let _ = log.send(format!(
+            "[engine] Applying {} route(s){}{} — a privilege prompt may appear if no sudoers rule is installed…",
+            route_count,
+            if half_internet { " [half-internet]" } else { "" },
+            if applied_dns { format!(" + DNS ({} domains)", vpn_domains.len()) } else { String::new() },
+        ));
     }
     // Disconnect requested while we were still setting up? Bail out before
     // entering the relay loop; dropping the TUN/TLS handles tears everything down.
