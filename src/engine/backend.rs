@@ -708,8 +708,22 @@ fn connect_inner_impl(
         let _ = log.send("[engine] WARNING: network setup still in progress — keeping the gateway route record; \
             it will be cleaned up on a later connect.".into());
     }
-    if let Some(pin) = pin.filter(|_| setup_done) {
-        match netcfg::remove_gateway_pin(&pin) {
+    // A newer connection may already use an identical pin (the helper's
+    // registry cannot tell them apart), so only a still-current attempt may
+    // delete it; the helper re-checks the attempt inside its pin lock. With
+    // no verifiable attempt id, keep the record for a later cleanup.
+    let current_attempt = attempt.as_ref().filter(|a| a.is_current());
+    let pin = match (pin, current_attempt) {
+        (Some(pin), None) if setup_done => {
+            let _ = log.send(format!(
+                "[engine] A newer connection has started (or no attempt id) — keeping gateway route {} for later cleanup.",
+                pin.dest));
+            None
+        }
+        (pin, _) => pin,
+    };
+    if let (Some(pin), Some(current)) = (pin.filter(|_| setup_done), current_attempt) {
+        match netcfg::remove_gateway_pin(&pin, current) {
             Ok(()) => {
                 if pin.presence() == Some(false) {
                     let tag = attempt.as_ref().map(|a| a.id().to_string())

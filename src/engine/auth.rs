@@ -41,7 +41,8 @@ pub(crate) fn read_http_response_bytes(stream: &mut impl Read) -> Result<Vec<u8>
             if buf.is_empty() {
                 return Err(VpnError::Auth("empty response from gateway".into()));
             }
-            break buf.len(); // connection closed mid-headers; return what we have
+            // A truncated response must never be parsed as complete.
+            return Err(VpnError::Auth("gateway closed the connection in the middle of the response headers".into()));
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > MAX_HTTP_RESPONSE {
@@ -55,7 +56,11 @@ pub(crate) fn read_http_response_bytes(stream: &mut impl Read) -> Result<Vec<u8>
         while buf.len() - header_end < clen {
             let n = stream.read(&mut tmp)
                 .map_err(|e| VpnError::Auth(format!("read body: {}", e)))?;
-            if n == 0 { break; }
+            if n == 0 {
+                return Err(VpnError::Auth(format!(
+                    "gateway closed the connection after {} of {} body bytes (truncated response)",
+                    buf.len() - header_end, clen)));
+            }
             buf.extend_from_slice(&tmp[..n]);
             if buf.len() > MAX_HTTP_RESPONSE {
                 return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
@@ -66,16 +71,52 @@ pub(crate) fn read_http_response_bytes(stream: &mut impl Read) -> Result<Vec<u8>
         while !(ends_with(&buf, b"\r\n\r\n") && decode_chunked(&buf[header_end..]).is_some()) {
             let n = stream.read(&mut tmp)
                 .map_err(|e| VpnError::Auth(format!("read chunked body: {}", e)))?;
-            if n == 0 { break; }
+            if n == 0 {
+                return Err(VpnError::Auth(
+                    "gateway closed the connection before the final chunk (truncated response)".into()));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > MAX_HTTP_RESPONSE {
+                return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
+            }
+        }
+    } else if connection_delimited(&headers) {
+        // No length and not chunked, but the server closes the connection to
+        // end the body (RFC 9112 §6.3): read until EOF.
+        loop {
+            let n = stream.read(&mut tmp)
+                .map_err(|e| VpnError::Auth(format!("read body: {}", e)))?;
+            if n == 0 {
+                break;
+            }
             buf.extend_from_slice(&tmp[..n]);
             if buf.len() > MAX_HTTP_RESPONSE {
                 return Err(VpnError::Auth("HTTP response exceeded size limit".into()));
             }
         }
     }
-    // else: no body indicated (e.g. redirect with Content-Length: 0) — done.
+    // else: keep-alive without a length — treated as having no body (a
+    // bodyless reply such as a redirect); reading on would block until the
+    // socket timeout.
 
     Ok(buf)
+}
+
+/// Whether a response without length/chunking ends its body by closing the
+/// connection: `Connection: close`, or HTTP/1.0 without `keep-alive`.
+/// Bodyless statuses (1xx, 204, 304) never have one.
+fn connection_delimited(headers_lower: &str) -> bool {
+    let status = headers_lower.lines().next().and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok()).unwrap_or(0);
+    if (100..200).contains(&status) || status == 204 || status == 304 {
+        return false;
+    }
+    let connection = headers_lower.lines()
+        .find_map(|l| l.strip_prefix("connection:"))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    connection.contains("close")
+        || (headers_lower.starts_with("http/1.0") && !connection.contains("keep-alive"))
 }
 
 /// Parse the Content-Length value from lowercased header text.
@@ -527,6 +568,42 @@ mod tests {
         assert_eq!(redirect_path("https://gw.example:443/remote/index?x=1"), "/remote/index?x=1");
         assert_eq!(redirect_path("/remote/fortisslvpn"), "/remote/fortisslvpn");
         assert_eq!(redirect_path("javascript:alert(1)"), "/remote/login");
+    }
+
+    fn read(raw: &[u8]) -> Result<Vec<u8>, VpnError> {
+        read_http_response_bytes(&mut std::io::Cursor::new(raw.to_vec()))
+    }
+
+    #[test]
+    fn truncated_responses_are_errors() {
+        // Regression (Copilot): EOF before Content-Length / final chunk / end of
+        // headers was accepted, so a truncated config could lose its routes.
+        assert!(read(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n<ipv4>").is_err());
+        assert!(read(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n<ipv\r\n").is_err());
+        assert!(read(b"HTTP/1.1 200 OK\r\nContent-Le").is_err());
+    }
+
+    #[test]
+    fn complete_and_delimited_responses() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n<ipv4>";
+        assert_eq!(read(ok).unwrap(), ok.to_vec());
+        // Connection-close delimited body: read to EOF.
+        let close = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<sslvpn-tunnel/>";
+        assert_eq!(read(close).unwrap(), close.to_vec());
+        // Keep-alive without a length, and 204 even with Connection: close:
+        // no further read after the headers (on a live socket it would block).
+        struct HeadersOnly(Option<&'static [u8]>);
+        impl std::io::Read for HeadersOnly {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let chunk = self.0.take().expect("must not read past the headers");
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+        for head in [&b"HTTP/1.1 302 Found\r\nLocation: /remote/index\r\n\r\n"[..],
+                     &b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"[..]] {
+            assert_eq!(read_http_response_bytes(&mut HeadersOnly(Some(head))).unwrap(), head.to_vec());
+        }
     }
 
     #[test]

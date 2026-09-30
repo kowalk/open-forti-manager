@@ -972,11 +972,13 @@ pub fn tun_ops_noninteractive(ifname: &str, ifindex: Option<u32>, ops: Vec<Op>) 
 /// Remove this session's gateway pin on disconnect (it lives on the physical
 /// interface, so deleting the TUN device does not clean it up). Only without
 /// prompting; otherwise it is left recorded for the next connect.
-pub fn remove_gateway_pin(pin: &PinRecord) -> Result<(), String> {
+pub fn remove_gateway_pin(pin: &PinRecord, attempt: &Attempt) -> Result<(), String> {
     if detect_elevation() == Elevation::Pkexec {
         return Err(format!("no passwordless privilege; host route {} left in place", pin.dest));
     }
-    if remove_pins(std::slice::from_ref(pin), None).is_empty() {
+    // The attempt id travels with the request: the helper deletes only while
+    // this attempt is still current (checked inside its pin lock).
+    if remove_pins(std::slice::from_ref(pin), Some(attempt)).is_empty() {
         Ok(())
     } else {
         Err(format!("could not remove host route {}", pin.to_line()))
