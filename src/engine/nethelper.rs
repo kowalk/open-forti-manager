@@ -134,6 +134,32 @@ fn valid_domain(d: &str) -> bool {
         })
 }
 
+/// Whether `a` is usable as the tunnel's own (routed, /32) client address.
+/// Shared by the in-process ioctl path and the helper, so both apply the
+/// same rules. Rejects addresses that cannot work as a routed source;
+/// private (RFC 1918), CGNAT and public unicast pools are all accepted, and
+/// `.0`/`.255` endings are fine on a /32.
+pub fn validate_tun_address(a: Ipv4Addr) -> Result<(), String> {
+    let o = a.octets();
+    let reason = if a.is_unspecified() || o[0] == 0 {
+        Some("unspecified / \"this network\" (0.0.0.0/8)")
+    } else if a.is_loopback() {
+        Some("loopback (127.0.0.0/8)")
+    } else if a.is_link_local() {
+        Some("link-local (169.254.0.0/16), which the gateway must not forward")
+    } else if a.is_multicast() {
+        Some("multicast (224.0.0.0/4)")
+    } else if o[0] >= 240 {
+        Some("reserved or broadcast (240.0.0.0/4)")
+    } else {
+        None
+    };
+    match reason {
+        Some(r) => Err(format!("invalid tunnel address {}: {}", a, r)),
+        None => Ok(()),
+    }
+}
+
 fn parse_v4(s: &str, what: &str) -> Result<Ipv4Addr, String> {
     s.parse().map_err(|_| format!("invalid {} {:?}", what, s))
 }
@@ -255,9 +281,7 @@ pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Resul
         Op::Addr { ip } => {
             let (tun, _) = session_tun(req, caller, sys)?;
             let a = parse_v4(ip, "address")?;
-            if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
-                return Err(format!("invalid address {}", a));
-            }
+            validate_tun_address(a)?; // before any address is flushed
             Ok(vec![
                 vec![IP_BIN.into(), "addr".into(), "flush".into(), "dev".into(), tun.to_string()],
                 vec![IP_BIN.into(), "addr".into(), "add".into(), format!("{}/32", a), "dev".into(), tun.to_string()],
@@ -797,6 +821,24 @@ mod tests {
         assert_eq!(n, 1, "second op never runs");
         assert!(!resp.results[0].ok);
         assert!(resp.aborted.is_some());
+    }
+
+    #[test]
+    fn tunnel_address_validation() {
+        // Regression (Copilot): the ioctl path accepted broadcast/loopback.
+        let ok = |s: &str| validate_tun_address(s.parse().unwrap()).is_ok();
+        for good in ["10.66.1.2", "172.31.9.4", "192.168.200.1", "100.64.0.5", "198.51.100.7",
+                     "10.0.0.0", "10.0.0.255"] {
+            assert!(ok(good), "{} must be accepted", good);
+        }
+        for bad in ["0.0.0.0", "0.1.2.3", "127.0.0.1", "169.254.1.1", "224.0.0.1",
+                    "239.255.255.250", "240.0.0.1", "255.255.255.255"] {
+            assert!(!ok(bad), "{} must be rejected", bad);
+        }
+        assert!(validate_tun_address("127.0.0.1".parse().unwrap()).unwrap_err().contains("loopback"));
+        // The helper applies the same rule before flushing anything.
+        assert!(plan(Op::Addr { ip: "127.0.0.1".into() }).is_err());
+        assert!(plan(Op::Addr { ip: "255.255.255.255".into() }).is_err());
     }
 
     #[test]

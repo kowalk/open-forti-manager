@@ -1383,7 +1383,7 @@ mod tests {
     fn detects_docker_shadowing() {
         let table = parse_route_table(
             "default via 192.168.10.1 dev wlan0 proto dhcp metric 600\n\
-             172.18.0.0/16 dev br-79188871ee2d proto kernel scope link src 172.18.0.1\n\
+             172.18.0.0/16 dev br-0123456789ab proto kernel scope link src 172.18.0.1\n\
              172.16.0.0/12 dev vpn0 scope link\n\
              10.200.0.0/24 dev docker0 proto kernel scope link src 10.200.0.1 linkdown\n");
         let shadowed = shadowed_ranges(&[p("172.16.0.0/12"), p("10.0.0.0/8")], "vpn0", &table);

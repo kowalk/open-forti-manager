@@ -120,6 +120,10 @@ impl TunDevice {
         if ip.is_unspecified() {
             return Err(VpnError::Route("no IP address assigned by the gateway".into()));
         }
+        // Same rules as the helper: the ioctl path must not accept addresses
+        // the kernel allows but that cannot work (loopback, broadcast, …).
+        crate::engine::nethelper::validate_tun_address(ip)
+            .map_err(|e| VpnError::Route(format!("the gateway assigned an unusable address — {}", e)))?;
 
         match self.ioctl_configure(&name, ip) {
             Ok(()) => {
