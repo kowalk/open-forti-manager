@@ -98,8 +98,13 @@ pub trait SysView {
     fn attempt_current(&self, id: &str) -> bool;
     /// Whether the helper installed pin `key` for `uid`.
     fn pin_registered(&self, uid: u32, key: &str) -> bool;
+    /// Register `key` for `uid`, dropping any other (stale) owner of the same
+    /// key: a successful add proves the route did not exist before.
     fn register_pin(&self, uid: u32, key: &str) -> Result<(), String>;
     fn unregister_pin(&self, uid: u32, key: &str);
+    /// Run a whole pin operation (kernel command + registry update) under one
+    /// exclusive lock, so concurrent helpers cannot interleave them.
+    fn with_pin_lock(&self, f: &mut dyn FnMut());
 }
 
 /// Registry key of a pin: `dest via|- dev`.
@@ -155,7 +160,8 @@ fn session_tun<'a>(req: &'a Request, caller: u32, sys: &impl SysView) -> Result<
 /// Whether an operation acts on the session TUN (and needs re-verification
 /// after each command).
 fn uses_session_tun(op: &Op) -> bool {
-    !matches!(op, Op::PinDel { .. })
+    // Pin operations act on the physical interface, not the TUN name.
+    !matches!(op, Op::PinDel { .. } | Op::PinAdd { .. })
 }
 
 /// Validate a gateway pin's fields: a /32 on an existing non-TUN device.
@@ -288,45 +294,57 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
             }
         }
         let mut changed_underneath = false;
-        let result = match plan_op(op, req, caller, sys) {
-            Err(e) => OpResult { ok: false, stderr: format!("rejected: {}", e) },
-            Ok(cmds) => {
-                let mut res = OpResult { ok: true, stderr: String::new() };
-                for argv in &cmds {
-                    let (ok, err) = run(argv);
-                    // `ip` resolves the device name again: make sure it still
-                    // is the caller's verified device.
-                    if uses_session_tun(op) {
-                        if let Err(e) = session_tun(req, caller, sys) {
-                            res = OpResult { ok: false, stderr: format!("interface changed during operation: {}", e) };
-                            changed_underneath = true;
+        let mut result = OpResult { ok: false, stderr: String::new() };
+        let mut body = || {
+            result = match plan_op(op, req, caller, sys) {
+                Err(e) => OpResult { ok: false, stderr: format!("rejected: {}", e) },
+                Ok(cmds) => {
+                    let mut res = OpResult { ok: true, stderr: String::new() };
+                    for argv in &cmds {
+                        let (ok, err) = run(argv);
+                        // `ip` resolves the device name again: make sure it
+                        // still is the caller's verified device.
+                        if uses_session_tun(op) {
+                            if let Err(e) = session_tun(req, caller, sys) {
+                                res = OpResult { ok: false, stderr: format!("interface changed during operation: {}", e) };
+                                changed_underneath = true;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            res = OpResult { ok: false, stderr: err };
                             break;
                         }
                     }
-                    if !ok {
-                        res = OpResult { ok: false, stderr: err };
-                        break;
+                    res
+                }
+            };
+            // Pin registry bookkeeping, only after the kernel accepted/removed
+            // the route — and in the same locked section as the command.
+            match op {
+                Op::PinAdd { dest, via, dev } if result.ok => {
+                    if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
+                        if let Err(e) = sys.register_pin(caller, &pin_key(p, v, dev)) {
+                            // Never leave a pin nobody may delete: roll it back.
+                            let (undone, _) = run(&route_argv("del", p, v, dev));
+                            result = OpResult { ok: false, stderr: format!(
+                                "pin could not be registered ({}); {}", e,
+                                if undone { "route rolled back" } else { "ROLLBACK FAILED" }) };
+                        }
                     }
                 }
-                res
+                Op::PinDel { dest, via, dev } if result.ok || result.stderr.contains("No such process") => {
+                    if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
+                        sys.unregister_pin(caller, &pin_key(p, v, dev));
+                    }
+                }
+                _ => {}
             }
         };
-        // Pin registry bookkeeping (only after the kernel accepted/removed it).
-        match op {
-            Op::PinAdd { dest, via, dev } if result.ok => {
-                if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
-                    if let Err(e) = sys.register_pin(caller, &pin_key(p, v, dev)) {
-                        resp.results.push(OpResult { ok: false, stderr: format!("pin added but not registered: {}", e) });
-                        continue;
-                    }
-                }
-            }
-            Op::PinDel { dest, via, dev } if result.ok || result.stderr.contains("No such process") => {
-                if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
-                    sys.unregister_pin(caller, &pin_key(p, v, dev));
-                }
-            }
-            _ => {}
+        if matches!(op, Op::PinAdd { .. } | Op::PinDel { .. }) {
+            sys.with_pin_lock(&mut body);
+        } else {
+            body();
         }
         resp.results.push(result);
         if changed_underneath {
@@ -414,14 +432,22 @@ impl SysView for RealSys {
 
     fn register_pin(&self, uid: u32, key: &str) -> Result<(), String> {
         registry::update(|entries| {
-            if !entries.iter().any(|(u, k)| *u == uid && k == key) {
-                entries.push((uid, key.to_string()));
-            }
+            entries.retain(|(_, k)| k != key);
+            entries.push((uid, key.to_string()));
         })
     }
 
     fn unregister_pin(&self, uid: u32, key: &str) {
         let _ = registry::update(|entries| entries.retain(|(u, k)| !(*u == uid && k == key)));
+    }
+
+    fn with_pin_lock(&self, f: &mut dyn FnMut()) {
+        // A lock file separate from the registry's own (flock on a second
+        // open file of the same path would deadlock). If it cannot be taken,
+        // the operation is still attempted: the registry updates themselves
+        // remain individually locked.
+        let _guard = registry::op_lock();
+        f();
     }
 }
 
@@ -463,6 +489,15 @@ mod registry {
             let (uid, key) = l.split_once(' ')?;
             Some((uid.parse().ok()?, key.to_string()))
         }).collect())
+    }
+
+    /// Exclusive lock serializing whole pin operations across helpers.
+    pub fn op_lock() -> Option<std::fs::File> {
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(DIR);
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+            .open(format!("{}/pins.oplock", DIR)).ok()?;
+        (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
     }
 
     pub fn with<T>(f: impl FnOnce(&[(u32, String)]) -> T) -> Result<T, String> {
@@ -514,6 +549,8 @@ mod tests {
         ifindex: RefCell<u32>,
         current_attempt: RefCell<String>,
         registry: RefCell<Vec<(u32, String)>>,
+        fail_register: RefCell<bool>,
+        locked_ops: RefCell<u32>,
     }
 
     impl SysView for FakeSys {
@@ -536,8 +573,17 @@ mod tests {
             self.registry.borrow().iter().any(|(u, k)| *u == uid && k == key)
         }
         fn register_pin(&self, uid: u32, key: &str) -> Result<(), String> {
-            self.registry.borrow_mut().push((uid, key.to_string()));
+            if *self.fail_register.borrow() {
+                return Err("disk full".into());
+            }
+            let mut r = self.registry.borrow_mut();
+            r.retain(|(_, k)| k != key);
+            r.push((uid, key.to_string()));
             Ok(())
+        }
+        fn with_pin_lock(&self, f: &mut dyn FnMut()) {
+            *self.locked_ops.borrow_mut() += 1;
+            f();
         }
         fn unregister_pin(&self, uid: u32, key: &str) {
             self.registry.borrow_mut().retain(|(u, k)| !(*u == uid && k == key));
@@ -546,7 +592,8 @@ mod tests {
 
     fn sys() -> FakeSys {
         FakeSys { tun_owner: Some(1000), ifindex: RefCell::new(42), current_attempt: RefCell::new("a1".into()),
-                  registry: RefCell::new(Vec::new()) }
+                  registry: RefCell::new(Vec::new()), fail_register: RefCell::new(false),
+                  locked_ops: RefCell::new(0) }
     }
 
     fn req(ops: Vec<Op>) -> Request {
@@ -642,6 +689,33 @@ mod tests {
         let resp = execute(&req(vec![add, del.clone()]), 1000, &s, |_| (true, String::new()));
         assert!(resp.results.iter().all(|r| r.ok), "{:?}", resp);
         assert!(!s.pin_registered(1000, "198.51.100.7/32 192.168.10.1 wlan0"));
+    }
+
+    #[test]
+    fn failed_registration_rolls_the_pin_back() {
+        // Regression (Astra): a pin added but not registered could never be
+        // deleted through the helper.
+        let s = sys();
+        *s.fail_register.borrow_mut() = true;
+        let add = Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() };
+        let mut ran: Vec<Vec<String>> = Vec::new();
+        let resp = execute(&req(vec![add]), 1000, &s, |argv| { ran.push(argv.to_vec()); (true, String::new()) });
+        assert!(!resp.results[0].ok);
+        assert!(resp.results[0].stderr.contains("rolled back"));
+        assert_eq!(ran[1][2], "del", "the route is deleted again");
+        assert_eq!(*s.locked_ops.borrow(), 1, "command + registry update under one lock");
+    }
+
+    #[test]
+    fn successful_add_clears_stale_owner_of_same_pin() {
+        // Regression (Astra): user A's stale entry survived route loss and let
+        // A delete user B's identical pin.
+        let s = sys();
+        s.registry.borrow_mut().push((1001, "198.51.100.7/32 192.168.10.1 wlan0".into()));
+        let add = Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() };
+        execute(&req(vec![add]), 1000, &s, |_| (true, String::new()));
+        assert!(s.pin_registered(1000, "198.51.100.7/32 192.168.10.1 wlan0"));
+        assert!(!s.pin_registered(1001, "198.51.100.7/32 192.168.10.1 wlan0"));
     }
 
     #[test]

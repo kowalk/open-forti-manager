@@ -357,6 +357,10 @@ fn connect_inner_impl(
     // network) could keep the gateway unreachable: clear it before connecting.
     // Without passwordless privilege this prompts only for *harmful* pins.
     let attempt = netcfg::Attempt::begin();
+    // Without an attempt id (no /run/user), still tag this connection's pin
+    // records uniquely, so reconnects in one process never share a tag.
+    let fallback_tag = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let (pending_pins, removed) = netcfg::cleanup_stale_pins_before_connect(attempt.as_ref());
     if removed > 0 {
         let _ = log.send(format!("[engine] Removed {} stale gateway host route(s) from a previous session.", removed));
@@ -522,7 +526,7 @@ fn connect_inner_impl(
         // Without an attempt id (no /run/user), still tag uniquely per process
         // so entries of different sessions never share a tag.
         let attempt_tag = attempt.as_ref().map(|a| a.id().to_string())
-            .unwrap_or_else(|| format!("{}-0", std::process::id()));
+            .unwrap_or_else(|| fallback_tag.clone());
         if let Some(pin) = &owned_pin {
             // The record must be durable *before* the route is installed: an
             // unrecorded pin could never be found and removed later.
@@ -647,7 +651,7 @@ fn connect_inner_impl(
             Ok(()) => {
                 if pin.presence() == Some(false) {
                     let tag = attempt.as_ref().map(|a| a.id().to_string())
-                        .unwrap_or_else(|| format!("{}-0", std::process::id()));
+                        .unwrap_or_else(|| fallback_tag.clone());
                     let _ = netcfg::forget_own(std::slice::from_ref(&pin), &tag);
                 }
                 let _ = log.send(format!("[engine] Removed gateway host route {}.", pin.dest));
