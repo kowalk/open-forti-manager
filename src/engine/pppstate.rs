@@ -28,8 +28,11 @@ const CODE_ECHO_REP: u8 = 10;
 
 // LCP option types
 const LCP_OPT_MRU: u8 = 1;
+const LCP_OPT_ACCM: u8 = 2;
 const LCP_OPT_AUTH: u8 = 3;
 const LCP_OPT_MAGIC: u8 = 5;
+const LCP_OPT_PFC: u8 = 7;
+const LCP_OPT_ACFC: u8 = 8;
 
 // IPCP option types
 const IPCP_OPT_ADDR: u8 = 3;
@@ -255,6 +258,25 @@ impl PppState {
         Some((pkt[0], pkt[1], &pkt[4..len]))
     }
 
+    /// Parse a Configure-Request's options strictly: None if any option is
+    /// shorter than 2 bytes or overruns the packet (RFC 1661 §6: discard).
+    fn options_strict(body: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            if i + 2 > body.len() {
+                return None;
+            }
+            let olen = body[i + 1] as usize;
+            if olen < 2 || i + olen > body.len() {
+                return None;
+            }
+            out.push((body[i], &body[i..i + olen]));
+            i += olen;
+        }
+        Some(out)
+    }
+
     /// Iterate well-formed (type, full option bytes) entries of an options list.
     fn options(body: &[u8]) -> Vec<(u8, &[u8])> {
         let mut out = Vec::new();
@@ -273,23 +295,51 @@ impl PppState {
 
         match code {
             CODE_CONF_REQ => {
-                // Gateway wants to configure the link. Reject auth (we don't do
-                // PAP/CHAP); record its MRU so the TUN MTU can honor it.
+                // Options in the gateway's request describe what *it* can
+                // receive (RFC 1661 §6): ACKing PFC/ACFC/ACCM only permits us
+                // to use them toward the gateway, which we simply never do.
+                // Everything we do not understand — auth included — is
+                // rejected; recognized options with bad values are NAK'd.
+                let Some(opts) = Self::options_strict(body) else {
+                    return; // malformed: silently discard
+                };
                 let mut reject = Vec::new();
-                for (opt, chunk) in Self::options(body) {
-                    match opt {
-                        LCP_OPT_AUTH => reject.extend_from_slice(chunk),
-                        LCP_OPT_MRU if chunk.len() == 4 => {
-                            self.peer_mru = Some(u16::from_be_bytes([chunk[2], chunk[3]]));
+                let mut nak = Vec::new();
+                let mut peer_mru = None;
+                for (opt, chunk) in opts {
+                    match (opt, chunk.len()) {
+                        (LCP_OPT_MRU, 4) => {
+                            let mru = u16::from_be_bytes([chunk[2], chunk[3]]);
+                            if mru >= 576 {
+                                peer_mru = Some(mru);
+                            } else {
+                                nak.extend_from_slice(&[LCP_OPT_MRU, 4, 0x05, 0xDC]); // suggest 1500
+                            }
                         }
-                        _ => {}
+                        (LCP_OPT_MAGIC, 6) => {
+                            let m = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+                            if m == 0 || m == self.magic {
+                                // Zero is invalid; equal to ours suggests a looped-back link.
+                                let suggest = (self.magic.rotate_left(7) ^ 0x5A5A_A5A5).max(1);
+                                nak.extend_from_slice(&[LCP_OPT_MAGIC, 6]);
+                                nak.extend_from_slice(&suggest.to_be_bytes());
+                            }
+                        }
+                        (LCP_OPT_MRU, _) => nak.extend_from_slice(&[LCP_OPT_MRU, 4, 0x05, 0xDC]),
+                        (LCP_OPT_ACCM, 6) | (LCP_OPT_PFC, 2) | (LCP_OPT_ACFC, 2) => {}
+                        _ => reject.extend_from_slice(chunk),
                     }
                 }
                 if !reject.is_empty() {
                     self.outbox.push(build_ppp(PROTO_LCP, CODE_CONF_REJ, id, &reject));
+                    self.lcp_acked_remote = false;
+                } else if !nak.is_empty() {
+                    self.outbox.push(build_ppp(PROTO_LCP, CODE_CONF_NAK, id, &nak));
+                    self.lcp_acked_remote = false;
                 } else {
                     // An ACK must echo the request's options verbatim.
                     self.outbox.push(build_ppp(PROTO_LCP, CODE_CONF_ACK, id, body));
+                    self.peer_mru = peer_mru;
                     self.lcp_acked_remote = true;
                 }
             }
@@ -356,9 +406,25 @@ impl PppState {
 
         match code {
             CODE_CONF_REQ => {
-                // Gateway's IPCP request — ACK it verbatim.
-                self.outbox.push(build_ppp(PROTO_IPCP, CODE_CONF_ACK, id, body));
-                self.ipcp_acked_remote = true;
+                // Gateway's IPCP request: only a well-formed IP-Address option
+                // is ACKed; anything else (e.g. IP-Compression-Protocol, which
+                // would only permit *us* to compress, RFC 1332 §4) is rejected.
+                let Some(opts) = Self::options_strict(body) else {
+                    return; // malformed: silently discard
+                };
+                let mut reject = Vec::new();
+                for (opt, chunk) in opts {
+                    if !(opt == IPCP_OPT_ADDR && chunk.len() == 6) {
+                        reject.extend_from_slice(chunk);
+                    }
+                }
+                if reject.is_empty() {
+                    self.outbox.push(build_ppp(PROTO_IPCP, CODE_CONF_ACK, id, body));
+                    self.ipcp_acked_remote = true;
+                } else {
+                    self.outbox.push(build_ppp(PROTO_IPCP, CODE_CONF_REJ, id, &reject));
+                    self.ipcp_acked_remote = false;
+                }
             }
             CODE_CONF_ACK if id == self.ipcp_req_id => {
                 if body != self.ipcp_req_opts.as_slice() {
@@ -633,6 +699,68 @@ mod tests {
         ppp.phase = Phase::Network;
         for _ in 0..20 { assert!(ppp.send_echo_request()); }
         assert_eq!(ppp.phase, Phase::Network);
+    }
+
+    fn last(ppp: &PppState) -> (u8, Vec<u8>) {
+        let f = ppp.outbox.last().expect("response");
+        (f[2], f[6..].to_vec())
+    }
+
+    #[test]
+    fn test_lcp_acks_receive_side_options_it_never_uses() {
+        // PFC/ACFC/ACCM in the gateway's request only permit *us* to use them.
+        let mut ppp = PppState::new(Ipv4Addr::new(10, 0, 0, 1), 1);
+        let opts = [LCP_OPT_MAGIC, 6, 1, 2, 3, 4, LCP_OPT_PFC, 2, LCP_OPT_ACFC, 2, LCP_OPT_ACCM, 6, 0, 0, 0, 0];
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 4, &opts));
+        assert_eq!(last(&ppp), (CODE_CONF_ACK, opts.to_vec()));
+        assert!(ppp.lcp_acked_remote);
+    }
+
+    #[test]
+    fn test_lcp_rejects_unknown_and_naks_bad_values() {
+        let mut ppp = PppState::new(Ipv4Addr::new(10, 0, 0, 1), 0x1111_1111);
+        // Callback (13) is unsupported: rejected, alone.
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 1, &[LCP_OPT_MAGIC, 6, 1, 2, 3, 4, 13, 3, 6]));
+        assert_eq!(last(&ppp), (CODE_CONF_REJ, vec![13, 3, 6]));
+        assert!(!ppp.lcp_acked_remote);
+        // MRU below 576 and a zero magic are NAK'd with suggestions.
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 2, &[LCP_OPT_MRU, 4, 0, 100, LCP_OPT_MAGIC, 6, 0, 0, 0, 0]));
+        let (code, body) = last(&ppp);
+        assert_eq!(code, CODE_CONF_NAK);
+        assert_eq!(&body[..4], &[LCP_OPT_MRU, 4, 0x05, 0xDC]);
+        assert_eq!(&body[4..6], &[LCP_OPT_MAGIC, 6]);
+        assert_ne!(&body[6..10], &[0, 0, 0, 0]);
+        // A PFC option with a bad length is rejected (not silently ACKed).
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 3, &[LCP_OPT_PFC, 3, 0]));
+        assert_eq!(last(&ppp).0, CODE_CONF_REJ);
+    }
+
+    #[test]
+    fn test_malformed_option_list_is_discarded() {
+        // Regression (Astra): an overrunning tail used to be truncated and the
+        // rest ACKed. RFC 1661 §6: discard the packet.
+        let mut ppp = PppState::new(Ipv4Addr::new(10, 0, 0, 1), 1);
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 1, &[LCP_OPT_MAGIC, 6, 1, 2, 3, 4, LCP_OPT_MRU, 9, 5]));
+        ppp.handle(&build_ppp(PROTO_IPCP, CODE_CONF_REQ, 1, &[IPCP_OPT_ADDR, 6, 1, 1, 1, 1, 2, 1]));
+        assert!(ppp.outbox.is_empty());
+        assert!(!ppp.lcp_acked_remote && !ppp.ipcp_acked_remote);
+    }
+
+    #[test]
+    fn test_ipcp_acks_only_address() {
+        let mut ppp = PppState::new(Ipv4Addr::new(10, 0, 0, 1), 1);
+        // IP-Compression-Protocol (2, VJ) is rejected; the flag stays false.
+        ppp.handle(&build_ppp(PROTO_IPCP, CODE_CONF_REQ, 5,
+            &[IPCP_OPT_ADDR, 6, 1, 1, 1, 1, 2, 6, 0x00, 0x2d, 0x0f, 0x01]));
+        assert_eq!(last(&ppp), (CODE_CONF_REJ, vec![2, 6, 0x00, 0x2d, 0x0f, 0x01]));
+        assert!(!ppp.ipcp_acked_remote);
+        // The retried address-only request is ACKed.
+        ppp.handle(&build_ppp(PROTO_IPCP, CODE_CONF_REQ, 6, &[IPCP_OPT_ADDR, 6, 1, 1, 1, 1]));
+        assert_eq!(last(&ppp).0, CODE_CONF_ACK);
+        assert!(ppp.ipcp_acked_remote);
+        // A later request that we reject clears a stale ACKed state.
+        ppp.handle(&build_ppp(PROTO_IPCP, CODE_CONF_REQ, 7, &[IPCP_OPT_ADDR, 4, 1, 1]));
+        assert!(!ppp.ipcp_acked_remote);
     }
 
     #[test]

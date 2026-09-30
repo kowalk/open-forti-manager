@@ -10,6 +10,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Route/DNS setup workers of this process. Teardown and the next connect
+/// wait for them (bounded) before judging or forgetting gateway-pin records:
+/// a worker still in flight may yet install a pin.
+static SETUP_WORKERS: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Wait up to `max` for all setup workers to finish. Returns true when none
+/// is still running.
+fn wait_setup_workers(max: Duration) -> bool {
+    let deadline = Instant::now() + max;
+    loop {
+        let running = {
+            let Ok(mut workers) = SETUP_WORKERS.lock() else { return false };
+            let (done, running): (Vec<_>, Vec<_>) = workers.drain(..).partition(|h| h.is_finished());
+            for h in done {
+                let _ = h.join();
+            }
+            let n = running.len();
+            workers.extend(running);
+            n
+        };
+        if running == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -361,7 +391,18 @@ fn connect_inner_impl(
     // records uniquely, so reconnects in one process never share a tag.
     let fallback_tag = format!("{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    let (pending_pins, removed) = netcfg::cleanup_stale_pins_before_connect(attempt.as_ref());
+    // A previous session's setup worker may still be adding a pin (e.g. stuck
+    // on a pkexec prompt): then leave all pin records alone this time — its
+    // record must survive so a later connect can remove that pin.
+    let prev_setup_idle = wait_setup_workers(Duration::from_secs(2));
+    if !prev_setup_idle {
+        let _ = log.send("[engine] A previous network setup is still running — skipping stale-route cleanup this time.".into());
+    }
+    let (pending_pins, removed) = if prev_setup_idle {
+        netcfg::cleanup_stale_pins_before_connect(attempt.as_ref())
+    } else {
+        (Vec::new(), 0)
+    };
     if removed > 0 {
         let _ = log.send(format!("[engine] Removed {} stale gateway host route(s) from a previous session.", removed));
     }
@@ -499,7 +540,11 @@ fn connect_inner_impl(
         let _ = log.send(format!("[engine] TUN {} configured with {} (MTU {})", ifname, ip, applied_mtu));
 
         // Always carried (even with Set Routes off) so no recorded pin is forgotten.
-        let stale_pins: Vec<netcfg::PinRecord> = netcfg::load_pin_state().into_iter().filter(|p| p.present()).collect();
+        let stale_pins: Vec<netcfg::PinRecord> = if prev_setup_idle {
+            netcfg::load_pin_state().into_iter().filter(|p| p.present()).collect()
+        } else {
+            Vec::new()
+        };
         let plan = netcfg::plan(
             &netcfg::PlanInput {
                 ifname: &ifname,
@@ -573,7 +618,7 @@ fn connect_inner_impl(
         let gw_pin2 = gw_pin.clone();
         let attempt2 = attempt.clone();
         let attempt_tag2 = attempt_tag.clone();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let result = netcfg::apply(&plan.cmds, &ifname2, ifindex, attempt2.as_ref(), &stop2);
             // Kernel said the pin already existed and it isn't one of ours:
             // it belongs to the user — never track or delete it.
@@ -621,6 +666,9 @@ fn connect_inner_impl(
                 }
             }
         });
+        if let Ok(mut workers) = SETUP_WORKERS.lock() {
+            workers.push(worker);
+        }
         Ok(())
     };
 
@@ -644,9 +692,17 @@ fn connect_inner_impl(
     let result = tunnel::run_relay(
         tls_stream, ppp_in, ppp_out, Some(fds), xml_ip, Some(log.clone()), stop.clone(), on_network);
 
-    // Clean up the gateway host route (it lives on the physical interface).
+    // Clean up the gateway host route (it lives on the physical interface) —
+    // but only once the setup worker is done: while it runs it may still add
+    // the pin, so judging "absent" now could forget a pin about to appear.
+    stop.store(true, Ordering::Relaxed);
+    let setup_done = wait_setup_workers(Duration::from_secs(5));
     let pin = gw_pin.lock().ok().and_then(|p| p.clone());
-    if let Some(pin) = pin {
+    if pin.is_some() && !setup_done {
+        let _ = log.send("[engine] WARNING: network setup still in progress — keeping the gateway route record; \
+            it will be cleaned up on a later connect.".into());
+    }
+    if let Some(pin) = pin.filter(|_| setup_done) {
         match netcfg::remove_gateway_pin(&pin) {
             Ok(()) => {
                 if pin.presence() == Some(false) {

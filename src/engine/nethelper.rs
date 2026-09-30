@@ -295,8 +295,18 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
             }
         }
         let mut changed_underneath = false;
+        let mut superseded = false;
         let mut result = OpResult { ok: false, stderr: String::new() };
         let mut body = || {
+            // Waiting for the pin lock may take a while: re-check that this
+            // attempt is still current once we hold it.
+            if let Some(id) = &req.attempt {
+                if !sys.attempt_current(id) {
+                    result = OpResult { ok: false, stderr: "superseded while waiting for the pin lock".into() };
+                    superseded = true;
+                    return;
+                }
+            }
             result = match plan_op(op, req, caller, sys) {
                 Err(e) => OpResult { ok: false, stderr: format!("rejected: {}", e) },
                 Ok(cmds) => {
@@ -350,6 +360,10 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
             body();
         }
         resp.results.push(result);
+        if superseded {
+            resp.aborted = Some("superseded: a newer connection attempt started".into());
+            break;
+        }
         if changed_underneath {
             resp.aborted = Some("the session interface changed during execution".into());
             break;
@@ -494,13 +508,29 @@ mod registry {
         }).collect())
     }
 
-    /// Exclusive lock serializing whole pin operations across helpers.
+    /// Exclusive lock serializing whole pin operations across helpers. Waits
+    /// at most `OP_LOCK_WAIT` (non-blocking retries on a monotonic deadline),
+    /// so a wedged concurrent helper cannot stall network setup forever.
     pub fn op_lock() -> Option<std::fs::File> {
+        const OP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
         let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(DIR);
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
             .mode(0o600).custom_flags(libc::O_NOFOLLOW)
             .open(format!("{}/pins.oplock", DIR)).ok()?;
-        (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+        let deadline = std::time::Instant::now() + OP_LOCK_WAIT;
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Some(f);
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}
+                _ => return None,
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     pub fn with<T>(f: impl FnOnce(&[(u32, String)]) -> T) -> Result<T, String> {
@@ -554,6 +584,7 @@ mod tests {
         registry: RefCell<Vec<(u32, String)>>,
         fail_register: RefCell<bool>,
         locked_ops: RefCell<u32>,
+        supersede_on_lock: RefCell<Option<String>>,
     }
 
     impl SysView for FakeSys {
@@ -586,6 +617,9 @@ mod tests {
         }
         fn with_pin_lock(&self, f: &mut dyn FnMut()) -> bool {
             *self.locked_ops.borrow_mut() += 1;
+            if let Some(next) = self.supersede_on_lock.borrow_mut().take() {
+                *self.current_attempt.borrow_mut() = next; // a newer attempt started meanwhile
+            }
             f();
             true
         }
@@ -597,7 +631,7 @@ mod tests {
     fn sys() -> FakeSys {
         FakeSys { tun_owner: Some(1000), ifindex: RefCell::new(42), current_attempt: RefCell::new("a1".into()),
                   registry: RefCell::new(Vec::new()), fail_register: RefCell::new(false),
-                  locked_ops: RefCell::new(0) }
+                  locked_ops: RefCell::new(0), supersede_on_lock: RefCell::new(None) }
     }
 
     fn req(ops: Vec<Op>) -> Request {
@@ -720,6 +754,19 @@ mod tests {
         execute(&req(vec![add]), 1000, &s, |_| (true, String::new()));
         assert!(s.pin_registered(1000, "198.51.100.7/32 192.168.10.1 wlan0"));
         assert!(!s.pin_registered(1001, "198.51.100.7/32 192.168.10.1 wlan0"));
+    }
+
+    #[test]
+    fn attempt_rechecked_after_acquiring_pin_lock() {
+        // Regression (Astra): the attempt check happened before waiting for
+        // the lock; a newer attempt starting meanwhile must stop the op.
+        let s = sys();
+        *s.supersede_on_lock.borrow_mut() = Some("a2".into());
+        let mut r = req(vec![Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() }]);
+        r.attempt = Some("a1".into());
+        let resp = execute(&r, 1000, &s, |_| panic!("must not run"));
+        assert!(!resp.results[0].ok);
+        assert!(resp.aborted.unwrap().starts_with("superseded"));
     }
 
     #[test]
