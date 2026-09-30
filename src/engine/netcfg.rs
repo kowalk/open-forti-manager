@@ -173,8 +173,10 @@ impl PinRecord {
     /// Whether this exact route exists: Some(true/false), or None when the
     /// routing table could not be queried.
     pub fn presence(&self) -> Option<bool> {
+        // -N: print the protocol as a number (the marker would otherwise be
+        // shown by name if it ever gets one).
         let out = Command::new(IP_BIN)
-            .args(["-4", "route", "show", "exact", &self.dest.to_string()])
+            .args(["-N", "-4", "route", "show", "exact", &self.dest.to_string()])
             .output()
             .ok()
             .filter(|o| o.status.success())?;
@@ -579,12 +581,24 @@ fn update_pin_state(f: impl FnOnce(&mut Vec<(PinRecord, String)>)) -> Result<(),
 }
 
 /// Record a pin this attempt is about to install (must succeed before
-/// installing it). Re-recording an existing identity re-tags it.
+/// installing it). Re-recording an existing identity re-tags it — unless the
+/// entry belongs to the *current* attempt and we are not it: a superseded
+/// attempt must never take over a newer attempt's pending record.
 pub fn record_pin(pin: &PinRecord, tag: &str) -> Result<(), String> {
     update_pin_state(|v| {
-        v.retain(|(p, _)| p != pin);
-        v.push((pin.clone(), tag.to_string()));
+        let current = Attempt::current_id().unwrap_or_default();
+        retag(v, pin, tag, &current);
     })
+}
+
+fn retag(entries: &mut Vec<(PinRecord, String)>, pin: &PinRecord, tag: &str, current: &str) {
+    if let Some((_, t)) = entries.iter().find(|(p, _)| p == pin) {
+        if !current.is_empty() && t == current && t != tag {
+            return; // owned by the current (newer) attempt
+        }
+    }
+    entries.retain(|(p, _)| p != pin);
+    entries.push((pin.clone(), tag.to_string()));
 }
 
 /// Forget this attempt's own entries for `pins`. Always allowed, even after
@@ -754,7 +768,13 @@ pub fn run_helper(req: &Request, elevation: Elevation) -> Result<Response, Strin
         return Err(format!("network helper {} is not installed", HELPER_BIN));
     }
     let mut cmd = match elevation {
-        Elevation::Root => Command::new(HELPER_BIN),
+        Elevation::Root => {
+            // A GUI started via sudo inherits SUDO_UID; the helper would then
+            // act for that user while the TUN is owned by root. Run as root.
+            let mut c = Command::new(HELPER_BIN);
+            c.env_remove("SUDO_UID").env_remove("PKEXEC_UID");
+            c
+        }
         Elevation::Sudo => {
             let mut c = Command::new("sudo");
             c.args(["-n", HELPER_BIN]);
@@ -1033,7 +1053,7 @@ mod tests {
         i.stale_pins = &stale;
         let plan = plan(&i, phys).unwrap();
         // Deletion is constrained to the recorded identity, never the bare prefix.
-        assert_eq!(&plan.cmds[0].argv[1..], &["route", "del", "198.51.100.7/32", "via", "10.9.9.1", "dev", "eth1", "proto", "186"]);
+        assert_eq!(&plan.cmds[0].argv[1..], &["route", "del", "198.51.100.7/32", "via", "10.9.9.1", "dev", "eth1", "proto", "157"]);
         assert!(plan.cmds[0].best_effort);
     }
 
@@ -1050,7 +1070,7 @@ mod tests {
         assert_eq!(PinRecord::parse(&r.to_line()), Some(r.clone()));
         let onlink = PinRecord { dest: p("1.2.3.4/32"), via: None, dev: "eth0".into() };
         assert_eq!(PinRecord::parse(&onlink.to_line()), Some(onlink.clone()));
-        assert_eq!(&onlink.del_argv()[1..], &["route", "del", "1.2.3.4/32", "scope", "link", "dev", "eth0", "proto", "186"]);
+        assert_eq!(&onlink.del_argv()[1..], &["route", "del", "1.2.3.4/32", "scope", "link", "dev", "eth0", "proto", "157"]);
         // Legacy prefix-only lines and unsafe device names are rejected.
         assert_eq!(PinRecord::parse("198.51.100.7/32"), None);
         assert_eq!(PinRecord::parse("1.2.3.4/32 - eth0 extra"), None);
@@ -1083,6 +1103,29 @@ mod tests {
         let mut v = vec![(pin(1), "old".to_string())];
         retain_unless_obsolete(&mut v, &[pin(1)], "cur", |_| None);
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn superseded_attempt_cannot_take_over_current_record() {
+        // Regression (Astra): an older attempt re-tagged a newer attempt's
+        // pending record, then its cleanup removed it.
+        let mut v = vec![(pin(1), "200-2".to_string())];
+        retag(&mut v, &pin(1), "100-1", "200-2");
+        assert_eq!(v, vec![(pin(1), "200-2".to_string())]);
+        // The current attempt may take over a stale (older) entry.
+        let mut v = vec![(pin(1), "100-1".to_string())];
+        retag(&mut v, &pin(1), "200-2", "200-2");
+        assert_eq!(v, vec![(pin(1), "200-2".to_string())]);
+    }
+
+    #[test]
+    fn route_entries_parse_numeric_proto() {
+        let e = route_entries("198.51.100.7 via 192.168.10.1 dev wlan0 proto 157 \n");
+        let pin = PinRecord { dest: p("198.51.100.7/32"), via: Some(ip("192.168.10.1")), dev: "wlan0".into() };
+        assert!(e[0].matches(&pin));
+        // Same identity without our marker (e.g. the user's own route) is not ours.
+        let e = route_entries("198.51.100.7 via 192.168.10.1 dev wlan0 proto 4 \n");
+        assert!(!e[0].matches(&pin));
     }
 
     #[test]

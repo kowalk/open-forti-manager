@@ -6,8 +6,9 @@
 # stdin and performs only validated operations —
 #   * on the caller's own VPN TUN device (vpn*, owned by the calling user,
 #     matching interface index), or
-#   * gateway host routes (/32) that only replicate the current physical path,
-#     and deletion of routes the app itself created (route marker proto 186).
+#   * during the caller's live VPN session, gateway host routes (/32) that
+#     only replicate the current physical path; and deletion only of pins the
+#     helper itself installed for the same user (root-owned registry).
 # It cannot take other interfaces down, flush them, change their DNS, or run
 # arbitrary programs. It does NOT grant a passwordless root shell.
 #

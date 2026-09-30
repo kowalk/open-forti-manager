@@ -8,11 +8,14 @@
 //! - VPN-interface operations must target a TUN device named `vpn*`, owned
 //!   by the calling user (the app sets TUNSETOWNER) and still carrying the
 //!   interface index given in the request.
-//! - Every route the helper adds carries the private [`ROUTE_PROTO`] marker;
-//!   gateway-pin deletion requires it, so a route the helper did not create
-//!   can never be deleted.
-//! - A gateway pin must be a /32 on a physical (non-TUN) interface whose next
-//!   hop equals the destination's current path, so it cannot redirect traffic.
+//! - Gateway pins may only be added during the caller's live session (valid
+//!   TUN as above), must be a /32 on a physical interface, and must replicate
+//!   the destination's current path, so they cannot redirect traffic.
+//! - A pin can only be deleted if the helper itself installed it *for the same
+//!   caller*: it keeps a root-owned registry (`/var/lib/open-forti-manager`).
+//!   Routes also carry the private [`ROUTE_PROTO`] marker, as defence in depth.
+//! - After each command on the session TUN, ownership and interface index are
+//!   verified again; if the device changed underneath, execution stops.
 //! - With an attempt id, each operation first checks that the attempt is
 //!   still current (a pkexec prompt approved late must not act for a
 //!   superseded connection attempt).
@@ -26,8 +29,10 @@ use crate::engine::netcfg::Prefix;
 
 /// Installed path of the helper (see debian/ and the sudoers rule).
 pub const HELPER_BIN: &str = "/usr/libexec/open-forti-manager-net";
-/// Route protocol number marking routes installed by this app.
-pub const ROUTE_PROTO: &str = "186";
+/// Route protocol number marking routes installed by this app. Unassigned in
+/// the kernel's RTPROT_* list and iproute2's rt_protos (186 would be BGP).
+/// Only a marker: authorization for deletion comes from the pin registry.
+pub const ROUTE_PROTO: &str = "157";
 
 const IP_BIN: &str = "/usr/sbin/ip";
 const RESOLVECTL_BIN: &str = "/usr/bin/resolvectl";
@@ -91,6 +96,15 @@ pub trait SysView {
     fn route_get(&self, ip: Ipv4Addr) -> Option<(Option<Ipv4Addr>, String)>;
     /// Whether attempt `id` is still the caller's current attempt.
     fn attempt_current(&self, id: &str) -> bool;
+    /// Whether the helper installed pin `key` for `uid`.
+    fn pin_registered(&self, uid: u32, key: &str) -> bool;
+    fn register_pin(&self, uid: u32, key: &str) -> Result<(), String>;
+    fn unregister_pin(&self, uid: u32, key: &str);
+}
+
+/// Registry key of a pin: `dest via|- dev`.
+fn pin_key(dest: Prefix, via: Option<Ipv4Addr>, dev: &str) -> String {
+    format!("{} {} {}", dest, via.map(|v| v.to_string()).unwrap_or_else(|| "-".into()), dev)
 }
 
 /// Linux interface-name rules (`dev_valid_name`): 1–15 bytes, not `.`/`..`,
@@ -119,7 +133,7 @@ fn parse_v4(s: &str, what: &str) -> Result<Ipv4Addr, String> {
 }
 
 /// Resolve and validate the session TUN device for a VPN-interface operation.
-fn session_tun<'a>(req: &'a Request, caller: u32, sys: &impl SysView) -> Result<&'a str, String> {
+fn session_tun<'a>(req: &'a Request, caller: u32, sys: &impl SysView) -> Result<(&'a str, u32), String> {
     let name = req.ifname.as_deref().ok_or("no session interface given")?;
     if !valid_ifname(name) || !name.starts_with("vpn") {
         return Err(format!("{:?} is not a VPN interface name", name));
@@ -135,7 +149,13 @@ fn session_tun<'a>(req: &'a Request, caller: u32, sys: &impl SysView) -> Result<
     if sys.ifindex(name) != Some(want) {
         return Err(format!("{} was replaced (interface index changed)", name));
     }
-    Ok(name)
+    Ok((name, want))
+}
+
+/// Whether an operation acts on the session TUN (and needs re-verification
+/// after each command).
+fn uses_session_tun(op: &Op) -> bool {
+    !matches!(op, Op::PinDel { .. })
 }
 
 /// Validate a gateway pin's fields: a /32 on an existing non-TUN device.
@@ -174,11 +194,14 @@ fn route_argv(verb: &str, dest: Prefix, via: Option<Ipv4Addr>, dev: &str) -> Vec
 pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Result<Vec<Vec<String>>, String> {
     match op {
         Op::RouteAdd { dest } => {
-            let tun = session_tun(req, caller, sys)?;
+            let (tun, _) = session_tun(req, caller, sys)?;
             let p = Prefix::parse(dest).ok_or_else(|| format!("invalid route {:?}", dest))?;
             Ok(vec![route_argv("add", p, None, tun)])
         }
         Op::PinAdd { dest, via, dev } => {
+            // Only during the caller's live session (e.g. not from a pkexec
+            // prompt approved after disconnecting).
+            session_tun(req, caller, sys)?;
             let (p, via) = pin_fields(dest, via, dev, sys)?;
             // Only replicate the current physical path — never redirect.
             match sys.route_get(p.net) {
@@ -190,25 +213,30 @@ pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Resul
         }
         Op::PinDel { dest, via, dev } => {
             let (p, via) = pin_fields(dest, via, dev, sys)?;
+            if !sys.pin_registered(caller, &pin_key(p, via, dev)) {
+                return Err(format!("pin {} was not installed by this helper for the caller", p));
+            }
             Ok(vec![route_argv("del", p, via, dev)])
         }
         Op::Dns { servers } => {
-            let tun = session_tun(req, caller, sys)?;
+            // resolvectl takes the interface *index*, binding the change to the
+            // device that was just verified (not to a name looked up again).
+            let (_, idx) = session_tun(req, caller, sys)?;
             if servers.is_empty() || servers.len() > 8 {
                 return Err("between 1 and 8 DNS servers required".into());
             }
-            let mut argv = vec![RESOLVECTL_BIN.into(), "dns".into(), tun.to_string()];
+            let mut argv = vec![RESOLVECTL_BIN.into(), "dns".into(), idx.to_string()];
             for s in servers {
                 argv.push(parse_v4(s, "DNS server")?.to_string());
             }
             Ok(vec![argv])
         }
         Op::Domain { domains } => {
-            let tun = session_tun(req, caller, sys)?;
+            let (_, idx) = session_tun(req, caller, sys)?;
             if domains.is_empty() || domains.len() > 32 {
                 return Err("between 1 and 32 DNS domains required".into());
             }
-            let mut argv = vec![RESOLVECTL_BIN.into(), "domain".into(), tun.to_string()];
+            let mut argv = vec![RESOLVECTL_BIN.into(), "domain".into(), idx.to_string()];
             for d in domains {
                 if !valid_domain(d) {
                     return Err(format!("invalid DNS domain {:?}", d));
@@ -218,7 +246,7 @@ pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Resul
             Ok(vec![argv])
         }
         Op::Addr { ip } => {
-            let tun = session_tun(req, caller, sys)?;
+            let (tun, _) = session_tun(req, caller, sys)?;
             let a = parse_v4(ip, "address")?;
             if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
                 return Err(format!("invalid address {}", a));
@@ -229,7 +257,7 @@ pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Resul
             ])
         }
         Op::Mtu { mtu } => {
-            let tun = session_tun(req, caller, sys)?;
+            let (tun, _) = session_tun(req, caller, sys)?;
             if !(576..=1500).contains(mtu) {
                 return Err(format!("MTU {} out of range 576..=1500", mtu));
             }
@@ -237,7 +265,7 @@ pub fn plan_op(op: &Op, req: &Request, caller: u32, sys: &impl SysView) -> Resul
                 "mtu".into(), mtu.to_string()]])
         }
         Op::LinkUp => {
-            let tun = session_tun(req, caller, sys)?;
+            let (tun, _) = session_tun(req, caller, sys)?;
             Ok(vec![vec![IP_BIN.into(), "link".into(), "set".into(), "dev".into(), tun.to_string(), "up".into()]])
         }
     }
@@ -259,12 +287,22 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
                 break;
             }
         }
+        let mut changed_underneath = false;
         let result = match plan_op(op, req, caller, sys) {
             Err(e) => OpResult { ok: false, stderr: format!("rejected: {}", e) },
             Ok(cmds) => {
                 let mut res = OpResult { ok: true, stderr: String::new() };
                 for argv in &cmds {
                     let (ok, err) = run(argv);
+                    // `ip` resolves the device name again: make sure it still
+                    // is the caller's verified device.
+                    if uses_session_tun(op) {
+                        if let Err(e) = session_tun(req, caller, sys) {
+                            res = OpResult { ok: false, stderr: format!("interface changed during operation: {}", e) };
+                            changed_underneath = true;
+                            break;
+                        }
+                    }
                     if !ok {
                         res = OpResult { ok: false, stderr: err };
                         break;
@@ -273,7 +311,28 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
                 res
             }
         };
+        // Pin registry bookkeeping (only after the kernel accepted/removed it).
+        match op {
+            Op::PinAdd { dest, via, dev } if result.ok => {
+                if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
+                    if let Err(e) = sys.register_pin(caller, &pin_key(p, v, dev)) {
+                        resp.results.push(OpResult { ok: false, stderr: format!("pin added but not registered: {}", e) });
+                        continue;
+                    }
+                }
+            }
+            Op::PinDel { dest, via, dev } if result.ok || result.stderr.contains("No such process") => {
+                if let (Some(p), Ok(v)) = (Prefix::parse(dest), via.as_deref().map(|v| v.parse()).transpose()) {
+                    sys.unregister_pin(caller, &pin_key(p, v, dev));
+                }
+            }
+            _ => {}
+        }
         resp.results.push(result);
+        if changed_underneath {
+            resp.aborted = Some("the session interface changed during execution".into());
+            break;
+        }
     }
     resp
 }
@@ -297,7 +356,11 @@ impl SysView for RealSys {
             return None;
         }
         let base = std::path::Path::new("/sys/class/net").join(ifname);
-        base.join("tun_flags").exists().then(|| {
+        // tun_flags exists for TUN *and* TAP devices: require IFF_TUN (0x1)
+        // and not IFF_TAP (0x2).
+        let flags = std::fs::read_to_string(base.join("tun_flags")).ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())?;
+        (flags & 0x1 != 0 && flags & 0x2 == 0).then(|| {
             std::fs::read_to_string(base.join("owner")).ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .filter(|o| *o >= 0)
@@ -344,6 +407,85 @@ impl SysView for RealSys {
         let n = f.read(&mut buf).unwrap_or(0);
         std::str::from_utf8(&buf[..n]).map(|s| s.trim() == id).unwrap_or(false)
     }
+
+    fn pin_registered(&self, uid: u32, key: &str) -> bool {
+        registry::with(|entries| entries.iter().any(|(u, k)| *u == uid && k == key)).unwrap_or(false)
+    }
+
+    fn register_pin(&self, uid: u32, key: &str) -> Result<(), String> {
+        registry::update(|entries| {
+            if !entries.iter().any(|(u, k)| *u == uid && k == key) {
+                entries.push((uid, key.to_string()));
+            }
+        })
+    }
+
+    fn unregister_pin(&self, uid: u32, key: &str) {
+        let _ = registry::update(|entries| entries.retain(|(u, k)| !(*u == uid && k == key)));
+    }
+}
+
+/// Root-owned registry of pins the helper installed, per caller uid, scoped
+/// to the current boot (routes do not survive a reboot).
+mod registry {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    const DIR: &str = "/var/lib/open-forti-manager";
+
+    fn boot_id() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map(|s| s.trim().to_string()).unwrap_or_default()
+    }
+
+    fn locked<T>(f: impl FnOnce(&std::path::Path) -> Result<T, String>) -> Result<T, String> {
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(DIR);
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+            .open(format!("{}/pins.lock", DIR)).map_err(|e| format!("registry lock: {}", e))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!("registry lock: {}", std::io::Error::last_os_error()));
+        }
+        f(std::path::Path::new(&format!("{}/pins", DIR)))
+    }
+
+    fn read(path: &std::path::Path) -> Result<Vec<(u32, String)>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("registry read: {}", e)),
+        };
+        let mut lines = text.lines();
+        if lines.next().and_then(|l| l.strip_prefix("boot ")) != Some(boot_id().as_str()) {
+            return Ok(Vec::new());
+        }
+        Ok(lines.filter_map(|l| {
+            let (uid, key) = l.split_once(' ')?;
+            Some((uid.parse().ok()?, key.to_string()))
+        }).collect())
+    }
+
+    pub fn with<T>(f: impl FnOnce(&[(u32, String)]) -> T) -> Result<T, String> {
+        locked(|path| read(path).map(|e| f(&e)))
+    }
+
+    pub fn update(f: impl FnOnce(&mut Vec<(u32, String)>)) -> Result<(), String> {
+        locked(|path| {
+            let mut entries = read(path)?;
+            f(&mut entries);
+            let tmp = path.with_extension("tmp");
+            let mut text = format!("boot {}\n", boot_id());
+            for (u, k) in &entries {
+                text.push_str(&format!("{} {}\n", u, k));
+            }
+            let mut file = std::fs::OpenOptions::new().create(true).truncate(true).write(true)
+                .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)
+                .map_err(|e| format!("registry write: {}", e))?;
+            file.write_all(text.as_bytes()).and_then(|_| file.sync_all())
+                .map_err(|e| format!("registry write: {}", e))?;
+            std::fs::rename(&tmp, path).map_err(|e| format!("registry write: {}", e))
+        })
+    }
 }
 
 /// Run one argv as the helper: absolute program path, empty environment
@@ -369,8 +511,9 @@ mod tests {
 
     struct FakeSys {
         tun_owner: Option<u32>,
-        ifindex: u32,
+        ifindex: RefCell<u32>,
         current_attempt: RefCell<String>,
+        registry: RefCell<Vec<(u32, String)>>,
     }
 
     impl SysView for FakeSys {
@@ -378,7 +521,7 @@ mod tests {
             if ifname == "vpn0" { Some(self.tun_owner) } else { None }
         }
         fn ifindex(&self, ifname: &str) -> Option<u32> {
-            if ifname == "vpn0" { Some(self.ifindex) } else { Some(2) }
+            if ifname == "vpn0" { Some(*self.ifindex.borrow()) } else { Some(2) }
         }
         fn iface_exists(&self, ifname: &str) -> bool {
             ["vpn0", "wlan0", "eth0"].contains(&ifname)
@@ -389,10 +532,21 @@ mod tests {
         fn attempt_current(&self, id: &str) -> bool {
             *self.current_attempt.borrow() == id
         }
+        fn pin_registered(&self, uid: u32, key: &str) -> bool {
+            self.registry.borrow().iter().any(|(u, k)| *u == uid && k == key)
+        }
+        fn register_pin(&self, uid: u32, key: &str) -> Result<(), String> {
+            self.registry.borrow_mut().push((uid, key.to_string()));
+            Ok(())
+        }
+        fn unregister_pin(&self, uid: u32, key: &str) {
+            self.registry.borrow_mut().retain(|(u, k)| !(*u == uid && k == key));
+        }
     }
 
     fn sys() -> FakeSys {
-        FakeSys { tun_owner: Some(1000), ifindex: 42, current_attempt: RefCell::new("a1".into()) }
+        FakeSys { tun_owner: Some(1000), ifindex: RefCell::new(42), current_attempt: RefCell::new("a1".into()),
+                  registry: RefCell::new(Vec::new()) }
     }
 
     fn req(ops: Vec<Op>) -> Request {
@@ -406,7 +560,7 @@ mod tests {
     #[test]
     fn route_add_targets_session_tun_with_marker() {
         let cmds = plan(Op::RouteAdd { dest: "10.1.2.3/8".into() }).unwrap();
-        assert_eq!(cmds, vec![vec!["/usr/sbin/ip", "route", "add", "10.0.0.0/8", "dev", "vpn0", "proto", "186"]]);
+        assert_eq!(cmds, vec![vec!["/usr/sbin/ip", "route", "add", "10.0.0.0/8", "dev", "vpn0", "proto", "157"]]);
     }
 
     #[test]
@@ -442,15 +596,16 @@ mod tests {
         let cmds = plan(Op::Domain { domains: vec!["~example.com".into(), "corp.example".into(), "~.".into()] }).unwrap();
         assert_eq!(&cmds[0][3..], &["~example.com", "corp.example", "~."]);
         assert!(plan(Op::Domain { domains: vec![".".into()] }).is_err(), "bare '.' is not a search domain");
+        // DNS is bound to the verified interface *index*, not the name.
         let cmds = plan(Op::Dns { servers: vec!["172.16.5.53".into()] }).unwrap();
-        assert_eq!(cmds[0], vec!["/usr/bin/resolvectl", "dns", "vpn0", "172.16.5.53"]);
+        assert_eq!(cmds[0], vec!["/usr/bin/resolvectl", "dns", "42", "172.16.5.53"]);
     }
 
     #[test]
     fn pin_add_must_match_current_path() {
         let ok = plan(Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() }).unwrap();
         assert_eq!(ok[0], vec!["/usr/sbin/ip", "route", "add", "198.51.100.7/32", "via", "192.168.10.1",
-            "dev", "wlan0", "proto", "186"]);
+            "dev", "wlan0", "proto", "157"]);
         // A different next hop would redirect traffic: rejected.
         assert!(plan(Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.66".into()), dev: "wlan0".into() }).is_err());
         // Only /32, only physical interfaces.
@@ -460,12 +615,63 @@ mod tests {
 
     #[test]
     fn pin_del_requires_marker_and_scope() {
+        // Registered for the caller (as if the helper had installed them).
+        let s = sys();
+        s.register_pin(1000, "198.51.100.7/32 10.9.9.1 eth0").unwrap();
+        s.register_pin(1000, "198.51.100.7/32 - eth0").unwrap();
+        let plan = |op: Op| plan_op(&op, &req(vec![]), 1000, &s);
         let with_via = plan(Op::PinDel { dest: "198.51.100.7/32".into(), via: Some("10.9.9.1".into()), dev: "eth0".into() }).unwrap();
         assert_eq!(with_via[0], vec!["/usr/sbin/ip", "route", "del", "198.51.100.7/32", "via", "10.9.9.1",
-            "dev", "eth0", "proto", "186"]);
+            "dev", "eth0", "proto", "157"]);
         let onlink = plan(Op::PinDel { dest: "198.51.100.7/32".into(), via: None, dev: "eth0".into() }).unwrap();
         assert_eq!(onlink[0], vec!["/usr/sbin/ip", "route", "del", "198.51.100.7/32", "scope", "link",
-            "dev", "eth0", "proto", "186"]);
+            "dev", "eth0", "proto", "157"]);
+    }
+
+    #[test]
+    fn pin_del_only_for_pins_the_helper_installed_for_the_caller() {
+        // Regression (Astra, High): any matching route could be deleted.
+        let s = sys();
+        let del = Op::PinDel { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() };
+        assert!(plan_op(&del, &req(vec![]), 1000, &s).is_err(), "not installed by the helper");
+        s.register_pin(1001, "198.51.100.7/32 192.168.10.1 wlan0").unwrap();
+        assert!(plan_op(&del, &req(vec![]), 1000, &s).is_err(), "installed for another user");
+        // Installed for this caller through the helper: then deletable, and
+        // the registry entry is dropped afterwards.
+        let add = Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() };
+        let resp = execute(&req(vec![add, del.clone()]), 1000, &s, |_| (true, String::new()));
+        assert!(resp.results.iter().all(|r| r.ok), "{:?}", resp);
+        assert!(!s.pin_registered(1000, "198.51.100.7/32 192.168.10.1 wlan0"));
+    }
+
+    #[test]
+    fn pin_add_requires_live_session() {
+        // Regression (Astra): a pkexec prompt approved after disconnect added
+        // the pin; also pins for arbitrary destinations without a session.
+        let add = Op::PinAdd { dest: "198.51.100.7/32".into(), via: Some("192.168.10.1".into()), dev: "wlan0".into() };
+        let mut r = req(vec![]);
+        r.ifname = None;
+        assert!(plan_op(&add, &r, 1000, &sys()).is_err());
+        let mut r = req(vec![]);
+        r.ifindex = Some(99); // TUN gone / replaced
+        assert!(plan_op(&add, &r, 1000, &sys()).is_err());
+    }
+
+    #[test]
+    fn device_replaced_during_execution_stops() {
+        // Regression (Astra): validation happened before `ip` resolved the
+        // name again. A swap detected after a command aborts the batch.
+        let s = sys();
+        let r = req(vec![Op::RouteAdd { dest: "10.0.0.0/8".into() }, Op::RouteAdd { dest: "10.1.0.0/16".into() }]);
+        let mut n = 0;
+        let resp = execute(&r, 1000, &s, |_| {
+            n += 1;
+            *s.ifindex.borrow_mut() = 77; // another device took the name
+            (true, String::new())
+        });
+        assert_eq!(n, 1, "second op never runs");
+        assert!(!resp.results[0].ok);
+        assert!(resp.aborted.is_some());
     }
 
     #[test]

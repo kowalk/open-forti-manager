@@ -519,7 +519,10 @@ fn connect_inner_impl(
         // a crash mid-setup still leaves the pin tracked — and the kernel's
         // answer to the add decides: EEXIST means the route is the user's.
         let owned_pin = plan.gw_pin.clone().filter(|pin| stale_pins.contains(pin) || pin.presence() != Some(true));
-        let attempt_tag = attempt.as_ref().map(|a| a.id().to_string()).unwrap_or_default();
+        // Without an attempt id (no /run/user), still tag uniquely per process
+        // so entries of different sessions never share a tag.
+        let attempt_tag = attempt.as_ref().map(|a| a.id().to_string())
+            .unwrap_or_else(|| format!("{}-0", std::process::id()));
         if let Some(pin) = &owned_pin {
             // The record must be durable *before* the route is installed: an
             // unrecorded pin could never be found and removed later.
@@ -643,7 +646,8 @@ fn connect_inner_impl(
         match netcfg::remove_gateway_pin(&pin) {
             Ok(()) => {
                 if pin.presence() == Some(false) {
-                    let tag = attempt.as_ref().map(|a| a.id().to_string()).unwrap_or_default();
+                    let tag = attempt.as_ref().map(|a| a.id().to_string())
+                        .unwrap_or_else(|| format!("{}-0", std::process::id()));
                     let _ = netcfg::forget_own(std::slice::from_ref(&pin), &tag);
                 }
                 let _ = log.send(format!("[engine] Removed gateway host route {}.", pin.dest));

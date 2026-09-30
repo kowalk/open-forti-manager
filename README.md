@@ -81,8 +81,10 @@ operation before running it:
 
 - VPN routes, DNS, address and MTU only on the caller's **own TUN device**
   (`vpn*`, owned by the calling user, matching interface index);
-- gateway host routes (`/32`) only if they replicate the **current physical
-  path**, and deletion only of routes the app created (route marker `proto 186`);
+- gateway host routes (`/32`) only during the caller's live session and only
+  if they replicate the **current physical path**; deletion only of pins the
+  helper itself installed for the same user (root-owned registry in
+  `/var/lib/open-forti-manager`, routes also marked `proto 157`);
 - no shell, no free-form arguments, and a request from a superseded connection
   attempt is ignored.
 
