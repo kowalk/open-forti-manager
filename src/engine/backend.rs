@@ -648,6 +648,9 @@ fn connect_inner_impl(
                         return;
                     }
                     let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", applied.method));
+                    for w in &applied.warnings {
+                        let _ = log2.send(format!("[engine] WARNING: {} — will retry on the next connect.", w));
+                    }
                     for dns in &dns_check {
                         if let Some((_, dev)) = netcfg::route_get(*dns) {
                             if dev != ifname2 && want_routes {

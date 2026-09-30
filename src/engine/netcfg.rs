@@ -203,7 +203,8 @@ pub struct RouteEntry {
     pub dest: Prefix,
     pub via: Option<Ipv4Addr>,
     pub dev: String,
-    /// Routing protocol (`proto` field), e.g. `186` for routes this app added.
+    /// Routing protocol (`proto` field, numeric via `ip -N`), e.g. `157`
+    /// ([`ROUTE_PROTO`]) for routes this app added.
     pub proto: Option<String>,
 }
 
@@ -811,8 +812,11 @@ pub fn run_helper(req: &Request, elevation: Elevation) -> Result<Response, Strin
 /// How a failed command should be treated.
 #[derive(Debug, PartialEq, Eq)]
 enum Failure {
-    /// Expected/harmless (best-effort command).
+    /// Expected/harmless (e.g. a stale pin that is already gone).
     Benign,
+    /// Not a setup failure, but must be visible: a best-effort cleanup of an
+    /// earlier session's pin did not succeed (its record is kept for retry).
+    Warning(String),
     /// `ip route add` hit an identical, already-present route: fine, but that
     /// route is not ours — the kernel's EEXIST is the authoritative signal.
     Preexisting(Prefix),
@@ -823,10 +827,18 @@ enum Failure {
 }
 
 fn classify_failure(cmd: &NetCmd, stderr: &str) -> Failure {
-    if cmd.best_effort {
-        return Failure::Benign;
-    }
     let stderr = stderr.trim();
+    if cmd.best_effort {
+        // Only the kernel's "no matching route" proves the stale pin is gone.
+        // Anything else (helper refusal — which is not proof of absence —,
+        // lock timeout, a real deletion error) is surfaced, and the pin's
+        // record is kept so a later connect retries.
+        if stderr.contains("No such process") {
+            return Failure::Benign;
+        }
+        return Failure::Warning(format!("could not remove stale gateway route ({}): {}", cmd.display(),
+            if stderr.is_empty() { "failed" } else { stderr }));
+    }
     if let (Some(dest), Some(dev)) = (cmd.route, cmd.dev()) {
         if stderr.contains("File exists") {
             return match route_exists(dest, dev) {
@@ -847,6 +859,8 @@ pub struct Applied {
     pub method: &'static str,
     /// Route destinations whose add found an identical route already present.
     pub preexisting: Vec<Prefix>,
+    /// Non-fatal problems to show the user (e.g. failed stale-pin cleanup).
+    pub warnings: Vec<String>,
 }
 
 /// Failed `apply`. Still reports pre-existing routes seen before the failure,
@@ -872,7 +886,7 @@ impl fmt::Display for ApplyError {
 /// Fold one command's failure into the running lists.
 fn record_failure(f: Failure, failures: &mut Vec<String>, preexisting: &mut Vec<Prefix>) {
     match f {
-        Failure::Benign => {}
+        Failure::Benign | Failure::Warning(_) => {}
         Failure::Preexisting(p) => preexisting.push(p),
         Failure::PreexistingConflict(p, msg) => {
             preexisting.push(p);
@@ -913,9 +927,13 @@ pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, attempt: Optio
 
     let mut failures = Vec::new();
     let mut preexisting = Vec::new();
+    let mut warnings = Vec::new();
     for (cmd, res) in cmds.iter().zip(resp.results.iter()) {
         if !res.ok {
-            record_failure(classify_failure(cmd, &res.stderr), &mut failures, &mut preexisting);
+            match classify_failure(cmd, &res.stderr) {
+                Failure::Warning(w) => warnings.push(w),
+                f => record_failure(f, &mut failures, &mut preexisting),
+            }
         }
     }
     if let Some(reason) = resp.aborted {
@@ -925,7 +943,7 @@ pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, attempt: Optio
         failures.push(format!("helper ran only {} of {} operations", resp.results.len(), cmds.len()));
     }
     if failures.is_empty() {
-        Ok(Applied { method: elevation.name(), preexisting })
+        Ok(Applied { method: elevation.name(), preexisting, warnings })
     } else {
         Err(ApplyError { msg: failures.join("; "), preexisting })
     }
@@ -1143,6 +1161,13 @@ mod tests {
     fn classify_best_effort_and_fatal() {
         let del = NetCmd::pin_del(&pin(1));
         assert_eq!(classify_failure(&del, "RTNETLINK answers: No such process"), Failure::Benign);
+        // Anything else from a stale-pin cleanup must be visible, not silent
+        // (a helper refusal is not proof the route is gone).
+        for err in ["rejected: pin 198.51.100.1/32 was not installed by this helper for the caller",
+                    "pin operation lock unavailable; not attempted",
+                    "RTNETLINK answers: Operation not permitted"] {
+            assert!(matches!(classify_failure(&del, err), Failure::Warning(w) if w.contains(err)), "{}", err);
+        }
         let add = NetCmd::tun_route(Prefix::parse("203.0.113.9/32").unwrap(), "ofm-test-nodev0");
         assert!(matches!(classify_failure(&add, "Cannot find device"), Failure::Fatal(_)));
         let mut failures = Vec::new();
