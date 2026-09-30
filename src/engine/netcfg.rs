@@ -10,6 +10,8 @@ use std::net::Ipv4Addr;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::engine::nethelper::{attempt_path, valid_ifname, Op, Request, Response, HELPER_BIN, ROUTE_PROTO};
+
 // Absolute paths the app invokes for network config. These must match the
 // Cmnd entries in the packaged sudoers drop-in (debian/open-forti-manager.sudoers)
 // so that `sudo -n` succeeds non-interactively without granting a root shell.
@@ -67,9 +69,11 @@ pub fn mask_to_len(mask: Ipv4Addr) -> Option<u8> {
     if m.checked_shl(len).unwrap_or(0) == 0 { Some(len as u8) } else { None }
 }
 
-/// One privileged command; `route` is set for `ip route add` entries.
+/// One privileged operation for the helper. `argv` is the equivalent command
+/// line, kept for logs and tests; `route` is set for route additions.
 #[derive(Debug, Clone)]
 pub struct NetCmd {
+    pub op: Op,
     pub argv: Vec<String>,
     pub route: Option<Prefix>,
     /// Failure is expected/harmless (e.g. deleting a route that may be gone).
@@ -77,19 +81,38 @@ pub struct NetCmd {
 }
 
 impl NetCmd {
-    fn route_add(dest: Prefix, via: Option<&str>, dev: &str) -> Self {
-        let mut argv = vec![IP_BIN.into(), "route".into(), "add".into(), dest.to_string()];
-        if let Some(via) = via {
-            argv.push("via".into());
-            argv.push(via.into());
-        }
-        argv.push("dev".into());
-        argv.push(dev.into());
-        Self { argv, route: Some(dest), best_effort: false }
+    /// Route `dest` into the session's TUN device.
+    fn tun_route(dest: Prefix, ifname: &str) -> Self {
+        let argv = vec![IP_BIN.into(), "route".into(), "add".into(), dest.to_string(), "dev".into(), ifname.into()];
+        Self { op: Op::RouteAdd { dest: dest.to_string() }, argv, route: Some(dest), best_effort: false }
     }
 
-    fn other(argv: Vec<String>) -> Self {
-        Self { argv, route: None, best_effort: false }
+    fn pin_add(pin: &PinRecord) -> Self {
+        let mut argv = vec![IP_BIN.into(), "route".into(), "add".into(), pin.dest.to_string()];
+        if let Some(via) = pin.via {
+            argv.push("via".into());
+            argv.push(via.to_string());
+        }
+        argv.push("dev".into());
+        argv.push(pin.dev.clone());
+        Self { op: pin.op(false), argv, route: Some(pin.dest), best_effort: false }
+    }
+
+    fn pin_del(pin: &PinRecord) -> Self {
+        Self { op: pin.op(true), argv: pin.del_argv(), route: None, best_effort: true }
+    }
+
+    fn dns(ifname: &str, servers: &[Ipv4Addr]) -> Self {
+        let mut argv = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.into()];
+        argv.extend(servers.iter().map(|d| d.to_string()));
+        let op = Op::Dns { servers: servers.iter().map(|d| d.to_string()).collect() };
+        Self { op, argv, route: None, best_effort: false }
+    }
+
+    fn domain(ifname: &str, domains: Vec<String>) -> Self {
+        let mut argv = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.into()];
+        argv.extend(domains.iter().cloned());
+        Self { op: Op::Domain { domains }, argv, route: None, best_effort: false }
     }
 
     /// Device named after `dev` in the argv (for route commands).
@@ -119,22 +142,18 @@ impl PinRecord {
     /// Parse `dest via|- dev`. Legacy prefix-only lines are rejected (their
     /// identity is unknown, so they must not be deleted blindly).
     fn parse(line: &str) -> Option<Self> {
-        let mut t = line.split_whitespace();
-        let dest = Prefix::parse(t.next()?)?;
-        let via = match t.next()? {
-            "-" => None,
-            v => Some(v.parse().ok()?),
-        };
-        let dev = t.next()?.to_string();
-        if !valid_ifname(&dev) || t.next().is_some() {
-            return None;
-        }
-        Some(Self { dest, via, dev })
+        parse_pin_entry(line).map(|(p, _)| p)
     }
 
-    /// `ip route del` constrained to this exact route. An on-link pin (no
-    /// next hop) is also constrained to `scope link`, so a gateway route that
-    /// replaced it on the same device (scope global) is never matched.
+    /// The helper operation that adds (`del == false`) or deletes this pin.
+    fn op(&self, del: bool) -> Op {
+        let (dest, via, dev) = (self.dest.to_string(), self.via.map(|v| v.to_string()), self.dev.clone());
+        if del { Op::PinDel { dest, via, dev } } else { Op::PinAdd { dest, via, dev } }
+    }
+
+    /// Equivalent `ip route del`: constrained to this exact route and to the
+    /// app's route marker. An on-link pin (no next hop) is also constrained to
+    /// `scope link`, so a gateway route that replaced it is never matched.
     fn del_argv(&self) -> Vec<String> {
         let mut argv = vec![IP_BIN.into(), "route".into(), "del".into(), self.dest.to_string()];
         match self.via {
@@ -147,8 +166,7 @@ impl PinRecord {
                 argv.push("link".into());
             }
         }
-        argv.push("dev".into());
-        argv.push(self.dev.clone());
+        argv.extend(["dev".into(), self.dev.clone(), "proto".into(), ROUTE_PROTO.into()]);
         argv
     }
 
@@ -177,28 +195,25 @@ impl PinRecord {
     }
 }
 
-/// Linux interface-name rules (net/core/dev.c `dev_valid_name`): 1–15 bytes,
-/// not `.`/`..`, no `/`, `:` or whitespace. Names are always shell-quoted.
-fn valid_ifname(name: &str) -> bool {
-    !name.is_empty() && name.len() < 16 && name != "." && name != ".."
-        && !name.bytes().any(|b| b == b'/' || b == b':' || b.is_ascii_whitespace())
-}
-
 /// One parsed routing-table entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteEntry {
     pub dest: Prefix,
     pub via: Option<Ipv4Addr>,
     pub dev: String,
+    /// Routing protocol (`proto` field), e.g. `186` for routes this app added.
+    pub proto: Option<String>,
 }
 
 impl RouteEntry {
+    /// Our pin: same identity *and* carrying the app's route marker.
     fn matches(&self, pin: &PinRecord) -> bool {
         self.dest == pin.dest && self.via == pin.via && self.dev == pin.dev
+            && self.proto.as_deref() == Some(ROUTE_PROTO)
     }
 }
 
-/// Parse `ip -4 route show` output (destination, next hop, device).
+/// Parse `ip -4 route show` output (destination, next hop, device, proto).
 pub fn route_entries(text: &str) -> Vec<RouteEntry> {
     text.lines()
         .filter_map(|line| {
@@ -207,7 +222,8 @@ pub fn route_entries(text: &str) -> Vec<RouteEntry> {
             let after = |key: &str| tokens.iter().position(|&t| t == key).and_then(|i| tokens.get(i + 1));
             let dev = after("dev")?.to_string();
             let via = after("via").and_then(|v| v.parse().ok());
-            Some(RouteEntry { dest, via, dev })
+            let proto = after("proto").map(|p| p.to_string());
+            Some(RouteEntry { dest, via, dev, proto })
         })
         .collect()
 }
@@ -260,7 +276,7 @@ pub fn plan(
     // Clean up a pin an earlier session had to leave behind (we are elevating
     // now anyway, so this costs no extra prompt). It may already be gone.
     for stale in input.stale_pins {
-        plan.cmds.push(NetCmd { argv: stale.del_argv(), route: None, best_effort: true });
+        plan.cmds.push(NetCmd::pin_del(stale));
         plan.notes.push(format!("Removing stale gateway host route {} from a previous session.", stale.to_line()));
     }
 
@@ -291,15 +307,15 @@ pub fn plan(
             if dev == ifname {
                 return Err(format!("gateway {} is already routed into {}", input.gateway, ifname));
             }
-            let pin = Prefix::new(input.gateway, 32);
-            plan.cmds.push(NetCmd::route_add(pin, via.as_deref(), &dev));
-            plan.gw_pin = Some(PinRecord { dest: pin, via: via.as_deref().and_then(|v| v.parse().ok()), dev });
+            let pin = PinRecord { dest: Prefix::new(input.gateway, 32), via: via.as_deref().and_then(|v| v.parse().ok()), dev };
+            plan.cmds.push(NetCmd::pin_add(&pin));
+            plan.gw_pin = Some(pin);
         }
 
         if plan.full_tunnel {
             for half in ["0.0.0.0/1", "128.0.0.0/1"] {
                 let p = Prefix::parse(half).expect("static prefix");
-                plan.cmds.push(NetCmd::route_add(p, None, ifname));
+                plan.cmds.push(NetCmd::tun_route(p, ifname));
                 plan.route_count += 1;
             }
         }
@@ -309,7 +325,7 @@ pub fn plan(
             if p.len == 0 || (p.len == 32 && p.net == input.gateway) {
                 continue; // covered by the /1 halves / pinned to the physical path
             }
-            plan.cmds.push(NetCmd::route_add(*p, None, ifname));
+            plan.cmds.push(NetCmd::tun_route(*p, ifname));
             plan.route_count += 1;
         }
         if !plan.full_tunnel {
@@ -318,7 +334,7 @@ pub fn plan(
             if input.want_dns {
                 for dns in input.dns {
                     if *dns != input.gateway && !split.iter().any(|p| p.contains(*dns)) {
-                        plan.cmds.push(NetCmd::route_add(Prefix::new(*dns, 32), None, ifname));
+                        plan.cmds.push(NetCmd::tun_route(Prefix::new(*dns, 32), ifname));
                         plan.route_count += 1;
                         plan.notes.push(format!("Added a host route for VPN DNS server {}.", dns));
                     }
@@ -332,9 +348,7 @@ pub fn plan(
             setup; internal hostnames may not resolve (IP access still works).".into());
     }
     if input.want_dns && !input.dns.is_empty() && input.dns_backend {
-        let mut dns_cmd = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.into()];
-        dns_cmd.extend(input.dns.iter().map(|d| d.to_string()));
-        plan.cmds.push(NetCmd::other(dns_cmd));
+        plan.cmds.push(NetCmd::dns(ifname, input.dns));
 
         // '~' marks routing-only domains (lookups for *.domain go to the VPN
         // DNS); plain entries are search suffixes. With neither, prefer the VPN
@@ -348,9 +362,7 @@ pub fn plan(
         if domains.is_empty() || plan.full_tunnel {
             domains.push("~.".into());
         }
-        let mut dom_cmd = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.into()];
-        dom_cmd.extend(domains);
-        plan.cmds.push(NetCmd::other(dom_cmd));
+        plan.cmds.push(NetCmd::domain(ifname, domains));
     }
 
     Ok(plan)
@@ -455,21 +467,42 @@ fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map(|s| s.trim().to_string()).unwrap_or_default()
 }
 
-/// Parse the state file: `boot <id>` header, then one pin per line. Records
+/// Parse one state line: `dest via|- dev [attempt]`. The attempt tag records
+/// which connection attempt created the entry.
+fn parse_pin_entry(line: &str) -> Option<(PinRecord, String)> {
+    let mut t = line.split_whitespace();
+    let dest = Prefix::parse(t.next()?)?;
+    let via = match t.next()? {
+        "-" => None,
+        v => Some(v.parse().ok()?),
+    };
+    let dev = t.next()?.to_string();
+    let tag = t.next().unwrap_or("").to_string();
+    let tag_ok = tag.len() <= 64 && tag.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    if !valid_ifname(&dev) || !tag_ok || t.next().is_some() {
+        return None;
+    }
+    Some((PinRecord { dest, via, dev }, tag))
+}
+
+/// Parse the state file: `boot <id>` header, then one entry per line. Entries
 /// from another boot, legacy prefix-only lines and malformed lines are dropped.
-fn parse_pin_state(text: &str, current_boot: &str) -> Vec<PinRecord> {
+fn parse_pin_entries(text: &str, current_boot: &str) -> Vec<(PinRecord, String)> {
     let mut lines = text.lines();
     match lines.next().and_then(|l| l.strip_prefix("boot ")) {
         Some(id) if id.trim() == current_boot && !current_boot.is_empty() => {}
         _ => return Vec::new(),
     }
-    let mut out: Vec<PinRecord> = Vec::new();
-    for rec in lines.filter_map(PinRecord::parse) {
-        if !out.contains(&rec) {
-            out.push(rec);
-        }
+    let mut out: Vec<(PinRecord, String)> = Vec::new();
+    for (rec, tag) in lines.filter_map(parse_pin_entry) {
+        out.retain(|(r, _)| *r != rec); // a later line for the same pin wins
+        out.push((rec, tag));
     }
     out
+}
+
+fn parse_pin_state(text: &str, current_boot: &str) -> Vec<PinRecord> {
+    parse_pin_entries(text, current_boot).into_iter().map(|(p, _)| p).collect()
 }
 
 /// Gateway pins this app installed but has not yet removed.
@@ -480,26 +513,27 @@ pub fn load_pin_state() -> Vec<PinRecord> {
         .unwrap_or_default()
 }
 
-/// Render the state file for `pins` (deduplicated), scoped to this boot.
-fn render_pin_state(pins: &[PinRecord], boot: &str) -> String {
+fn render_pin_entries(entries: &[(PinRecord, String)], boot: &str) -> String {
     let mut text = format!("boot {}\n", boot);
-    let mut seen: Vec<&PinRecord> = Vec::new();
-    for p in pins {
-        if !seen.contains(&p) {
-            seen.push(p);
-            text.push_str(&p.to_line());
-            text.push('\n');
+    for (p, tag) in entries {
+        text.push_str(&p.to_line());
+        if !tag.is_empty() {
+            text.push(' ');
+            text.push_str(tag);
         }
+        text.push('\n');
     }
     text
 }
 
-/// Read-modify-write the pin records at `path` under an exclusive lock, so
+/// Read-modify-write the pin entries at `path` under an exclusive lock, so
 /// concurrent sessions apply *changes* instead of overwriting each other's
 /// snapshot. The new content goes to a temp file that is renamed into place
-/// (atomic). Errors are returned: a caller about to install a pin must not
-/// proceed without a durable ownership record.
-fn update_pin_state_at(path: &std::path::Path, boot: &str, f: impl FnOnce(&mut Vec<PinRecord>)) -> Result<(), String> {
+/// (atomic). Only a missing file counts as "no entries"; any other read error
+/// is returned, so unreadable state is never silently replaced. Errors are
+/// returned to the caller: a pin must not be installed without its record.
+fn update_pin_state_at(path: &std::path::Path, boot: &str,
+                       f: impl FnOnce(&mut Vec<(PinRecord, String)>)) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let dir = path.parent().ok_or("invalid pin state path")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
@@ -511,10 +545,14 @@ fn update_pin_state_at(path: &std::path::Path, boot: &str, f: impl FnOnce(&mut V
     }
     // The lock is released when `lock` is dropped at the end of this function.
 
-    let mut pins = std::fs::read_to_string(path).map(|t| parse_pin_state(&t, boot)).unwrap_or_default();
-    f(&mut pins);
+    let mut entries = match std::fs::read_to_string(path) {
+        Ok(t) => parse_pin_entries(&t, boot),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
+    };
+    f(&mut entries);
 
-    if pins.is_empty() {
+    if entries.is_empty() {
         return match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -525,7 +563,7 @@ fn update_pin_state_at(path: &std::path::Path, boot: &str, f: impl FnOnce(&mut V
     let write = || -> std::io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(render_pin_state(&pins, boot).as_bytes())?;
+        file.write_all(render_pin_entries(&entries, boot).as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
     };
@@ -535,94 +573,118 @@ fn update_pin_state_at(path: &std::path::Path, boot: &str, f: impl FnOnce(&mut V
     })
 }
 
-fn update_pin_state(f: impl FnOnce(&mut Vec<PinRecord>)) -> Result<(), String> {
+fn update_pin_state(f: impl FnOnce(&mut Vec<(PinRecord, String)>)) -> Result<(), String> {
     let path = pin_state_path().ok_or("no cache directory (HOME/XDG_CACHE_HOME unset)")?;
     update_pin_state_at(&path, &boot_id(), f)
 }
 
-/// Record a pin we are about to install (must succeed before installing it).
-pub fn record_pin(pin: &PinRecord) -> Result<(), String> {
-    update_pin_state(|v| if !v.contains(pin) { v.push(pin.clone()) })
+/// Record a pin this attempt is about to install (must succeed before
+/// installing it). Re-recording an existing identity re-tags it.
+pub fn record_pin(pin: &PinRecord, tag: &str) -> Result<(), String> {
+    update_pin_state(|v| {
+        v.retain(|(p, _)| p != pin);
+        v.push((pin.clone(), tag.to_string()));
+    })
 }
 
-/// Forget the given pin records, leaving every other record untouched.
-pub fn forget_pins(pins: &[PinRecord]) -> Result<(), String> {
+/// Forget this attempt's own entries for `pins`. Always allowed, even after
+/// the attempt was superseded — e.g. to retract a tentative ownership claim.
+pub fn forget_own(pins: &[PinRecord], tag: &str) -> Result<(), String> {
     if pins.is_empty() {
         return Ok(());
     }
-    update_pin_state(|v| v.retain(|p| !pins.contains(p)))
+    update_pin_state(|v| v.retain(|(p, t)| !(pins.contains(p) && t == tag)))
 }
 
-/// A connection attempt's identity, persisted so that privileged cleanup
+/// Which entries `forget_absent` may drop: listed, confirmed gone, and not
+/// tagged with the *current* attempt (whose entries may be recorded ahead of
+/// installation — e.g. while its pkexec prompt is open).
+fn retain_unless_obsolete(entries: &mut Vec<(PinRecord, String)>, pins: &[PinRecord], current: &str,
+                          presence: impl Fn(&PinRecord) -> Option<bool>) {
+    entries.retain(|(p, t)| {
+        let obsolete = pins.contains(p) && (current.is_empty() || t != current) && presence(p) == Some(false);
+        !obsolete
+    })
+}
+
+/// Forget entries for `pins` whose routes are confirmed gone, except entries
+/// of the current attempt (see `retain_unless_obsolete`).
+pub fn forget_absent(pins: &[PinRecord]) -> Result<(), String> {
+    if pins.is_empty() {
+        return Ok(());
+    }
+    update_pin_state(|v| {
+        let current = Attempt::current_id().unwrap_or_default();
+        retain_unless_obsolete(v, pins, &current, |p| p.presence());
+    })
+}
+
+/// A connection attempt's identity, persisted so that privileged operations
 /// started by an *older* attempt (e.g. a pkexec prompt approved after the
-/// user cancelled and reconnected) can tell it is stale and do nothing —
-/// the newer session may own an identical route by then.
+/// user cancelled and reconnected) can tell it is stale and do nothing.
+/// The helper checks it too, from the same uid-derived path.
 #[derive(Clone)]
 pub struct Attempt {
     id: String,
-    path: std::path::PathBuf,
 }
 
 impl Attempt {
-    /// Start a new attempt, superseding any earlier one.
+    fn path() -> std::path::PathBuf {
+        attempt_path(unsafe { libc::getuid() })
+    }
+
+    /// Start a new attempt, superseding any earlier one. None when the user's
+    /// runtime directory (/run/user/<uid>) is unavailable.
     pub fn begin() -> Option<Self> {
-        let path = pin_state_path()?.with_file_name("attempt");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        use std::os::unix::fs::DirBuilderExt;
+        let path = Self::path();
+        let dir = path.parent()?;
+        if !dir.parent()?.is_dir() {
+            return None;
         }
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let id = format!("{}-{}", std::process::id(), nanos);
         std::fs::write(&path, &id).ok()?;
-        Some(Self { id, path })
+        Some(Self { id })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The id of the most recently started attempt, if any.
+    pub fn current_id() -> Option<String> {
+        std::fs::read_to_string(Self::path()).ok().map(|s| s.trim().to_string())
     }
 
     /// Whether no newer attempt has started since this one.
     pub fn is_current(&self) -> bool {
-        std::fs::read_to_string(&self.path).map(|s| s.trim() == self.id).unwrap_or(false)
-    }
-
-    /// Shell test that is true only while this attempt is current (checked
-    /// inside the privileged script, i.e. *after* the prompt was approved).
-    fn shell_guard(&self) -> String {
-        format!("[ \"$(cat {} 2>/dev/null)\" = {} ] || exit 4",
-            shell_quote(&self.path.to_string_lossy()), shell_quote(&self.id))
+        Self::current_id().as_deref() == Some(self.id.as_str())
     }
 }
 
-/// Delete the given pins (each constrained to its exact identity). Uses
-/// passwordless privilege when available; otherwise prompts via pkexec only
-/// when an `attempt` is given (and only acts if that attempt is still the
-/// current one once the prompt is approved). Returns the pins still present.
+/// Delete the given pins via the helper (each constrained to its exact
+/// identity and the app's route marker). Without passwordless privilege it
+/// prompts via pkexec only when an `attempt` is given — and the helper then
+/// acts only while that attempt is still current. Returns the pins still present.
 pub fn remove_pins(pins: &[PinRecord], attempt: Option<&Attempt>) -> Vec<PinRecord> {
     let present: Vec<PinRecord> = pins.iter().filter(|p| p.present()).cloned().collect();
     if present.is_empty() {
         return present;
     }
-    let current = || attempt.map(|a| a.is_current()).unwrap_or(true);
-    match detect_elevation() {
-        Elevation::Root => {
-            for p in present.iter().take_while(|_| current()) {
-                let argv = p.del_argv();
-                let _ = Command::new(&argv[0]).args(&argv[1..]).status();
-            }
-        }
-        Elevation::SudoPerCmd => {
-            for p in present.iter().take_while(|_| current()) {
-                let _ = Command::new("sudo").arg("-n").args(p.del_argv()).stdin(Stdio::null()).status();
-            }
-        }
-        Elevation::Pkexec => {
-            let Some(attempt) = attempt else { return present };
-            let guard = attempt.shell_guard();
-            let script = present.iter()
-                .map(|p| format!("{}\n{} 2>/dev/null", guard,
-                    p.del_argv().iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = Command::new("pkexec").args(["sh", "-c", &script]).status();
-        }
+    let elevation = detect_elevation();
+    if elevation == Elevation::Pkexec && attempt.is_none() {
+        return present;
     }
+    let req = Request {
+        ifname: None,
+        ifindex: None,
+        attempt: attempt.map(|a| a.id().to_string()),
+        ops: present.iter().map(|p| p.op(true)).collect(),
+    };
+    let _ = run_helper(&req, elevation);
     // Keep everything not *confirmed* gone.
     present.into_iter().filter(|p| p.presence() != Some(false)).collect()
 }
@@ -635,7 +697,7 @@ pub fn remove_pins(pins: &[PinRecord], attempt: Option<&Attempt>) -> Vec<PinReco
 pub fn cleanup_stale_pins_before_connect(attempt: Option<&Attempt>) -> (Vec<PinRecord>, usize) {
     let (present, gone): (Vec<PinRecord>, Vec<PinRecord>) =
         load_pin_state().into_iter().partition(|p| p.presence() != Some(false));
-    let _ = forget_pins(&gone); // only drops records confirmed absent
+    let _ = forget_absent(&gone);
     if present.is_empty() {
         return (Vec::new(), 0);
     }
@@ -649,42 +711,80 @@ pub fn cleanup_stale_pins_before_connect(attempt: Option<&Attempt>) -> (Vec<PinR
         remove_pins(&present, attempt)
     };
     let removed: Vec<PinRecord> = present.iter().filter(|p| !remaining.contains(p)).cloned().collect();
-    if attempt.map(|a| a.is_current()).unwrap_or(true) {
-        let _ = forget_pins(&removed);
-    }
+    let _ = forget_absent(&removed);
     (remaining, removed.len())
 }
 
-/// How network configuration commands should be elevated.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How the helper is run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Elevation {
-    /// Already root — run directly.
+    /// Already root — run the helper directly.
     Root,
-    /// Narrow passwordless sudo (packaged sudoers rule) — run each command via `sudo -n`.
-    SudoPerCmd,
-    /// No standing privilege — run the batch once behind a graphical pkexec prompt.
+    /// Packaged sudoers rule — `sudo -n` the helper (no arguments, no prompt).
+    Sudo,
+    /// No standing privilege — run the helper behind a graphical pkexec prompt.
     Pkexec,
 }
 
-/// Probe whether our exact `ip route` command runs non-interactively.
+impl Elevation {
+    fn name(self) -> &'static str {
+        match self {
+            Elevation::Root => "root",
+            Elevation::Sudo => "sudo",
+            Elevation::Pkexec => "pkexec",
+        }
+    }
+}
+
+/// Probe whether the helper runs non-interactively via the sudoers rule.
 pub fn detect_elevation() -> Elevation {
     if unsafe { libc::geteuid() } == 0 {
         return Elevation::Root;
     }
-    let can_sudo = Command::new("sudo")
-        .args(["-n", IP_BIN, "route", "show"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if can_sudo { Elevation::SudoPerCmd } else { Elevation::Pkexec }
+    if run_helper(&Request::default(), Elevation::Sudo).is_ok() { Elevation::Sudo } else { Elevation::Pkexec }
 }
 
-/// Single-quote an argument for safe inclusion in an `sh -c` batch.
-fn shell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\\''"))
+/// Error text returned when the pkexec prompt was dismissed.
+const PROMPT_DISMISSED: &str = "the administrator prompt was dismissed or authorization failed";
+
+/// Send one request to the privileged helper and parse its response.
+pub fn run_helper(req: &Request, elevation: Elevation) -> Result<Response, String> {
+    use std::io::Write;
+    if !std::path::Path::new(HELPER_BIN).exists() {
+        return Err(format!("network helper {} is not installed", HELPER_BIN));
+    }
+    let mut cmd = match elevation {
+        Elevation::Root => Command::new(HELPER_BIN),
+        Elevation::Sudo => {
+            let mut c = Command::new("sudo");
+            c.args(["-n", HELPER_BIN]);
+            c
+        }
+        Elevation::Pkexec => {
+            let mut c = Command::new("pkexec");
+            c.arg(HELPER_BIN);
+            c
+        }
+    };
+    let json = serde_json::to_string(req).map_err(|e| e.to_string())?;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {}", elevation.name(), e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(json.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("{}: {}", elevation.name(), e))?;
+    if elevation == Elevation::Pkexec && matches!(out.status.code(), Some(126) | Some(127)) {
+        return Err(PROMPT_DISMISSED.into());
+    }
+    if !out.status.success() {
+        return Err(format!("{} helper exited with {}: {}", elevation.name(), out.status,
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("invalid helper response: {}", e))
 }
 
 /// Decide whether a failed command is benign; returns the error text if not.
@@ -762,81 +862,72 @@ fn record_failure(f: Failure, failures: &mut Vec<String>, preexisting: &mut Vec<
     }
 }
 
-/// Apply the command list with the least privilege available.
+/// Apply the command list through the privileged helper.
 ///
-/// `ifindex` binds the batch to this session's interface: if the device was
-/// replaced (disconnect + reconnect reused the name) nothing is applied.
-pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, stop: &AtomicBool) -> Result<Applied, ApplyError> {
+/// `ifindex` binds the batch to this session's interface: the helper checks
+/// it before every interface operation, so nothing lands on a replacement
+/// device. With `attempt`, the helper also stops once a newer attempt starts.
+pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, attempt: Option<&Attempt>,
+             stop: &AtomicBool) -> Result<Applied, ApplyError> {
     let ifindex = ifindex.ok_or_else(|| ApplyError::from(format!("cannot read the interface index of {}", ifname)))?;
+    if stop.load(Ordering::Relaxed) {
+        return Err(ApplyError::from(String::from("cancelled: disconnect requested during network setup")));
+    }
+    if current_ifindex(ifname) != Some(ifindex) {
+        return Err(ApplyError::from(format!("{} was replaced by a newer session; not applying stale config", ifname)));
+    }
     let elevation = detect_elevation();
-    let still_ours = || current_ifindex(ifname) == Some(ifindex);
+    let req = Request {
+        ifname: Some(ifname.to_string()),
+        ifindex: Some(ifindex),
+        attempt: attempt.map(|a| a.id().to_string()),
+        ops: cmds.iter().map(|c| c.op.clone()).collect(),
+    };
+    let resp = run_helper(&req, elevation).map_err(|e| {
+        if e == PROMPT_DISMISSED {
+            ApplyError::from(format!("{} — no routes or DNS were applied", PROMPT_DISMISSED))
+        } else {
+            ApplyError::from(e)
+        }
+    })?;
 
-    match elevation {
-        Elevation::SudoPerCmd => {
-            let mut failures = Vec::new();
-            let mut preexisting = Vec::new();
-            for cmd in cmds {
-                // Early exits still report what was learned so far.
-                if stop.load(Ordering::Relaxed) {
-                    return Err(ApplyError { msg: "cancelled: disconnect requested during network setup".into(), preexisting });
-                }
-                if !still_ours() {
-                    return Err(ApplyError { msg: format!("{} was replaced by a newer session; not applying stale config", ifname), preexisting });
-                }
-                match Command::new("sudo").arg("-n").args(&cmd.argv).stdin(Stdio::null()).output() {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => record_failure(classify_failure(cmd, &String::from_utf8_lossy(&o.stderr)), &mut failures, &mut preexisting),
-                    Err(e) => failures.push(format!("{}: {}", cmd.display(), e)),
-                }
-            }
-            if failures.is_empty() { Ok(Applied { method: "sudo", preexisting }) } else { Err(ApplyError { msg: failures.join("; "), preexisting }) }
+    let mut failures = Vec::new();
+    let mut preexisting = Vec::new();
+    for (cmd, res) in cmds.iter().zip(resp.results.iter()) {
+        if !res.ok {
+            record_failure(classify_failure(cmd, &res.stderr), &mut failures, &mut preexisting);
         }
-        Elevation::Root | Elevation::Pkexec => {
-            if stop.load(Ordering::Relaxed) {
-                return Err(ApplyError::from(String::from("cancelled: disconnect requested during network setup")));
-            }
-            // Re-check ownership before *every* command: a stalled command must
-            // not let later ones land on a replacement interface.
-            let guard = format!(
-                "[ \"$(cat {} 2>/dev/null)\" = \"{}\" ] || {{ echo OFM_ABORT >&2; exit 3; }}\n",
-                shell_quote(&format!("/sys/class/net/{}/ifindex", ifname)), ifindex);
-            let mut script = String::from("set -u\n");
-            for (i, cmd) in cmds.iter().enumerate() {
-                let line = cmd.argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-                script.push_str(&guard);
-                script.push_str(&format!(
-                    "if ! out=$({} 2>&1); then printf 'OFM_FAIL %d ' {} >&2; printf '%s' \"$out\" | tr '\\n' ' ' >&2; echo >&2; fi\n",
-                    line, i));
-            }
-            let (method, out) = match elevation {
-                Elevation::Root => ("root", Command::new("sh").args(["-c", &script]).output()),
-                _ => ("pkexec", Command::new("pkexec").args(["sh", "-c", &script]).output()),
-            };
-            let out = out.map_err(|e| ApplyError::from(format!("{}: {}", method, e)))?;
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if method == "pkexec" && matches!(out.status.code(), Some(126) | Some(127)) {
-                return Err(ApplyError::from(String::from("the administrator prompt was dismissed or authorization failed — no routes or DNS were applied")));
-            }
-            // Collect per-command results first, so an abort part-way through
-            // still reports the pre-existing routes seen before it.
-            let mut failures = Vec::new();
-            let mut preexisting = Vec::new();
-            for line in stderr.lines() {
-                if let Some(rest) = line.strip_prefix("OFM_FAIL ") {
-                    let (idx, msg) = rest.split_once(' ').unwrap_or((rest, ""));
-                    if let Some(cmd) = idx.parse::<usize>().ok().and_then(|i| cmds.get(i)) {
-                        record_failure(classify_failure(cmd, msg), &mut failures, &mut preexisting);
-                    }
-                }
-            }
-            if stderr.contains("OFM_ABORT") {
-                return Err(ApplyError { msg: format!("{} was replaced by a newer session; not applying stale config", ifname), preexisting });
-            }
-            if !out.status.success() && failures.is_empty() {
-                failures.push(format!("{} exited with {}: {}", method, out.status, stderr.trim()));
-            }
-            if failures.is_empty() { Ok(Applied { method, preexisting }) } else { Err(ApplyError { msg: failures.join("; "), preexisting }) }
-        }
+    }
+    if let Some(reason) = resp.aborted {
+        return Err(ApplyError { msg: format!("network setup stopped: {}", reason), preexisting });
+    }
+    if resp.results.len() < cmds.len() {
+        failures.push(format!("helper ran only {} of {} operations", resp.results.len(), cmds.len()));
+    }
+    if failures.is_empty() {
+        Ok(Applied { method: elevation.name(), preexisting })
+    } else {
+        Err(ApplyError { msg: failures.join("; "), preexisting })
+    }
+}
+
+/// Run TUN-device operations (address/MTU/up) through the helper without
+/// ever prompting — only a fallback for when the in-process ioctl fails.
+pub fn tun_ops_noninteractive(ifname: &str, ifindex: Option<u32>, ops: Vec<Op>) -> Result<(), String> {
+    let elevation = detect_elevation();
+    if elevation == Elevation::Pkexec {
+        return Err("no CAP_NET_ADMIN and no passwordless helper access".into());
+    }
+    let n = ops.len();
+    let req = Request { ifname: Some(ifname.to_string()), ifindex, attempt: None, ops };
+    let resp = run_helper(&req, elevation)?;
+    if let Some(r) = resp.aborted {
+        return Err(r);
+    }
+    match resp.results.iter().find(|r| !r.ok) {
+        Some(r) => Err(r.stderr.clone()),
+        None if resp.results.len() == n => Ok(()),
+        None => Err("helper did not run every operation".into()),
     }
 }
 
@@ -942,7 +1033,7 @@ mod tests {
         i.stale_pins = &stale;
         let plan = plan(&i, phys).unwrap();
         // Deletion is constrained to the recorded identity, never the bare prefix.
-        assert_eq!(&plan.cmds[0].argv[1..], &["route", "del", "198.51.100.7/32", "via", "10.9.9.1", "dev", "eth1"]);
+        assert_eq!(&plan.cmds[0].argv[1..], &["route", "del", "198.51.100.7/32", "via", "10.9.9.1", "dev", "eth1", "proto", "186"]);
         assert!(plan.cmds[0].best_effort);
     }
 
@@ -959,7 +1050,7 @@ mod tests {
         assert_eq!(PinRecord::parse(&r.to_line()), Some(r.clone()));
         let onlink = PinRecord { dest: p("1.2.3.4/32"), via: None, dev: "eth0".into() };
         assert_eq!(PinRecord::parse(&onlink.to_line()), Some(onlink.clone()));
-        assert_eq!(&onlink.del_argv()[1..], &["route", "del", "1.2.3.4/32", "scope", "link", "dev", "eth0"]);
+        assert_eq!(&onlink.del_argv()[1..], &["route", "del", "1.2.3.4/32", "scope", "link", "dev", "eth0", "proto", "186"]);
         // Legacy prefix-only lines and unsafe device names are rejected.
         assert_eq!(PinRecord::parse("198.51.100.7/32"), None);
         assert_eq!(PinRecord::parse("1.2.3.4/32 - eth0 extra"), None);
@@ -980,28 +1071,36 @@ mod tests {
     }
 
     #[test]
-    fn attempt_guard_detects_newer_attempt() {
-        let dir = std::env::temp_dir().join(format!("ofm-attempt-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("attempt");
-        std::fs::write(&path, "old").unwrap();
-        let old = Attempt { id: "old".into(), path: path.clone() };
-        assert!(old.is_current());
-        std::fs::write(&path, "new").unwrap(); // a newer attempt began
-        assert!(!old.is_current());
-        // The same check runs inside the privileged script.
-        let ok = |a: &Attempt| Command::new("sh").args(["-c", &format!("{}; exit 0", a.shell_guard())])
-            .status().unwrap().success();
-        assert!(!ok(&old));
-        assert!(ok(&Attempt { id: "new".into(), path: path.clone() }));
-        let _ = std::fs::remove_dir_all(dir);
+    fn forget_absent_rules_protect_current_attempt() {
+        // Regression (Astra): an older worker's "absent" cleanup erased a newer
+        // session's entry recorded ahead of installation.
+        let gone = |_: &PinRecord| Some(false);
+        let mut v = vec![(pin(1), "old".to_string()), (pin(2), "cur".to_string()), (pin(3), "old".to_string())];
+        retain_unless_obsolete(&mut v, &[pin(1), pin(2)], "cur", gone);
+        assert_eq!(v, vec![(pin(2), "cur".to_string()), (pin(3), "old".to_string())],
+            "absent + not current -> dropped; current attempt's entry kept; unlisted untouched");
+        // Presence unknown or still present: kept.
+        let mut v = vec![(pin(1), "old".to_string())];
+        retain_unless_obsolete(&mut v, &[pin(1)], "cur", |_| None);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn tagged_entries_roundtrip_and_retag() {
+        let text = render_pin_entries(&[(pin(1), "123-456".into()), (pin(2), String::new())], "b1");
+        let back = parse_pin_entries(&text, "b1");
+        assert_eq!(back, vec![(pin(1), "123-456".into()), (pin(2), String::new())]);
+        // A later line for the same identity wins (retagging).
+        let text = format!("{}{} 999-1\n", text, pin(1).to_line());
+        assert_eq!(parse_pin_entries(&text, "b1").iter().find(|(p, _)| *p == pin(1)).unwrap().1, "999-1");
+        assert!(parse_pin_entry("198.51.100.1/32 - eth0 not-a-tag!").is_none());
     }
 
     #[test]
     fn classify_best_effort_and_fatal() {
-        let del = NetCmd { argv: vec![IP_BIN.into(), "route".into(), "del".into(), "1.2.3.4/32".into()], route: None, best_effort: true };
+        let del = NetCmd::pin_del(&pin(1));
         assert_eq!(classify_failure(&del, "RTNETLINK answers: No such process"), Failure::Benign);
-        let add = NetCmd::route_add(Prefix::parse("203.0.113.9/32").unwrap(), None, "ofm-test-nodev0");
+        let add = NetCmd::tun_route(Prefix::parse("203.0.113.9/32").unwrap(), "ofm-test-nodev0");
         assert!(matches!(classify_failure(&add, "Cannot find device"), Failure::Fatal(_)));
         let mut failures = Vec::new();
         let mut pre = Vec::new();
@@ -1021,9 +1120,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ofm-pinstate-{}", std::process::id()));
         let path = dir.join("gateway-pin");
         let _ = std::fs::remove_dir_all(&dir);
-        update_pin_state_at(&path, "b1", |v| v.push(pin(1))).unwrap(); // session A
-        update_pin_state_at(&path, "b1", |v| v.push(pin(2))).unwrap(); // session B
-        update_pin_state_at(&path, "b1", |v| v.retain(|x| *x != pin(1))).unwrap(); // A forgets only its own
+        update_pin_state_at(&path, "b1", |v| v.push((pin(1), "100-1".into()))).unwrap(); // session A
+        update_pin_state_at(&path, "b1", |v| v.push((pin(2), "200-2".into()))).unwrap(); // session B
+        update_pin_state_at(&path, "b1", |v| v.retain(|(x, _)| *x != pin(1))).unwrap(); // A forgets only its own
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(parse_pin_state(&text, "b1"), vec![pin(2)]);
         // Removing the last record removes the file; no temp file is left behind.
@@ -1043,9 +1142,21 @@ mod tests {
         // so setup refuses to install a pin it could not record.
         let file = std::env::temp_dir().join(format!("ofm-notadir-{}", std::process::id()));
         std::fs::write(&file, "x").unwrap();
-        let r = update_pin_state_at(&file.join("gateway-pin"), "b1", |v| v.push(pin(1)));
+        let r = update_pin_state_at(&file.join("gateway-pin"), "b1", |v| v.push((pin(1), String::new())));
         assert!(r.is_err());
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error_not_empty() {
+        // Regression (Astra): a read error other than NotFound must not be
+        // treated as "no entries" and overwritten.
+        let dir = std::env::temp_dir().join(format!("ofm-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("gateway-pin")).unwrap(); // a directory: read fails with EISDIR
+        let r = update_pin_state_at(&dir.join("gateway-pin"), "b1", |v| v.push((pin(1), String::new())));
+        assert!(r.unwrap_err().starts_with("read "));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

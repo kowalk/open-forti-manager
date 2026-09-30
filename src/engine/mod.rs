@@ -11,6 +11,7 @@ pub mod backend;
 pub mod gateway;
 pub mod hdlc;
 pub mod netcfg;
+pub mod nethelper;
 pub mod http_server;
 pub mod ppp;
 pub mod pppstate;

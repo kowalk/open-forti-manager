@@ -27,10 +27,11 @@ fn parse_vpn_ip(xml: &str) -> Ipv4Addr {
 
 /// Extract split-tunnel routes from XML (<addr ip='x.x.x.x' mask='y.y.y.y' />),
 /// normalized to network addresses. Entries with an unparsable address or a
-/// non-contiguous mask are skipped (and logged) instead of producing a bogus
-/// `ip route add` that would fail.
-fn parse_split_routes(xml: &str) -> Vec<Prefix> {
+/// non-contiguous mask are returned separately (as their raw tag) so the
+/// caller can report them — malformed policy must not look like "no routes".
+fn parse_split_routes(xml: &str) -> (Vec<Prefix>, Vec<String>) {
     let mut routes = Vec::new();
+    let mut malformed = Vec::new();
     let mut pos = 0;
     while let Some(start) = xml[pos..].find("<addr ") {
         let abs = pos + start;
@@ -47,11 +48,11 @@ fn parse_split_routes(xml: &str) -> Vec<Prefix> {
                     routes.push(p);
                 }
             }
-            _ => log::warn!("Ignoring malformed split route: {}", tag),
+            _ => malformed.push(tag.trim().to_string()),
         }
         pos = abs + end + 2;
     }
-    routes
+    (routes, malformed)
 }
 
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
@@ -382,7 +383,7 @@ fn connect_inner_impl(
                 return Ok(());
             }
             let gone: Vec<netcfg::PinRecord> = pending_pins.iter().filter(|p| !left.contains(p)).cloned().collect();
-            let _ = netcfg::forget_pins(&gone);
+            let _ = netcfg::forget_absent(&gone);
             gateway::connect_blocking(profile)?
         }
         Err(e) => return Err(e),
@@ -417,11 +418,25 @@ fn connect_inner_impl(
     let _ = log.send(format!("[engine] Config XML ({} bytes): {:.500}", config_xml.len(), config_xml));
     let xml_ip = parse_vpn_ip(&config_xml);
     let vpn_dns = parse_vpn_dns(&config_xml);
-    let vpn_routes = parse_split_routes(&config_xml);
+    let (vpn_routes, malformed_routes) = parse_split_routes(&config_xml);
     let vpn_domains = parse_split_dns_domains(&config_xml);
     let vpn_suffixes = parse_dns_suffixes(&config_xml);
     let _ = log.send(format!("[engine] IP: {}, DNS: {:?}, Domains: {:?}, Search: {:?}, Routes: {}",
         xml_ip, vpn_dns, vpn_domains, vpn_suffixes, vpn_routes.len()));
+
+    // Malformed split routes: warn and continue if some are valid; fail if
+    // none are (an empty list would otherwise be taken as a full tunnel).
+    if !malformed_routes.is_empty() && profile.set_routes != Some(false) {
+        let sample: Vec<&str> = malformed_routes.iter().take(5).map(|s| s.as_str()).collect();
+        if vpn_routes.is_empty() {
+            return Err(VpnError::Route(format!(
+                "the gateway advertised {} split route(s) but none could be parsed (e.g. {:?}); \
+                 refusing to guess the routing policy", malformed_routes.len(), sample)));
+        }
+        let _ = log.send(format!(
+            "[engine] WARNING: skipped {} malformed split route(s) from the gateway — those networks \
+             will NOT go through the VPN: {:?}", malformed_routes.len(), sample));
+    }
 
     if stop.load(Ordering::Relaxed) {
         let _ = log.send("[engine] Disconnect requested during setup — aborting.".into());
@@ -504,10 +519,11 @@ fn connect_inner_impl(
         // a crash mid-setup still leaves the pin tracked — and the kernel's
         // answer to the add decides: EEXIST means the route is the user's.
         let owned_pin = plan.gw_pin.clone().filter(|pin| stale_pins.contains(pin) || pin.presence() != Some(true));
+        let attempt_tag = attempt.as_ref().map(|a| a.id().to_string()).unwrap_or_default();
         if let Some(pin) = &owned_pin {
             // The record must be durable *before* the route is installed: an
             // unrecorded pin could never be found and removed later.
-            netcfg::record_pin(pin).map_err(|e| format!(
+            netcfg::record_pin(pin, &attempt_tag).map_err(|e| format!(
                 "cannot record ownership of gateway route {} ({}); refusing to install it", pin.dest, e))?;
         }
         if let Some(pin) = &owned_pin {
@@ -549,35 +565,28 @@ fn connect_inner_impl(
         let dns_check = vpn_dns.clone();
         let gw_pin2 = gw_pin.clone();
         let attempt2 = attempt.clone();
+        let attempt_tag2 = attempt_tag.clone();
         thread::spawn(move || {
-            let result = netcfg::apply(&plan.cmds, &ifname2, ifindex, &stop2);
+            let result = netcfg::apply(&plan.cmds, &ifname2, ifindex, attempt2.as_ref(), &stop2);
             // Kernel said the pin already existed and it isn't one of ours:
             // it belongs to the user — never track or delete it.
             let preexisting = match &result {
                 Ok(applied) => &applied.preexisting,
                 Err(err) => &err.preexisting,
             };
-            // Record changes are deltas (never snapshots), so they can't erase
-            // another session's records. Ownership changes are applied only
-            // while this attempt is still the current one.
-            let current = attempt2.as_ref().map(|a| a.is_current()).unwrap_or(true);
+            // Record changes are tagged deltas, never snapshots. Retracting our
+            // own tentative claim is always allowed (even if superseded);
+            // other entries are dropped only when confirmed gone and not
+            // owned by the current attempt.
             if let Some(pin) = &owned_pin {
                 if preexisting.contains(&pin.dest) && !stale_pins.contains(pin) {
                     if let Ok(mut slot) = gw_pin2.lock() {
                         *slot = None;
                     }
-                    if current {
-                        let _ = netcfg::forget_pins(std::slice::from_ref(pin));
-                    }
+                    let _ = netcfg::forget_own(std::slice::from_ref(pin), &attempt_tag2);
                 }
             }
-            // Stale records whose routes are confirmed gone can be dropped by
-            // anyone; unknown or present ones are kept.
-            let gone: Vec<netcfg::PinRecord> = stale_pins.iter()
-                .filter(|p| p.presence() == Some(false))
-                .cloned()
-                .collect();
-            let _ = netcfg::forget_pins(&gone);
+            let _ = netcfg::forget_absent(&stale_pins);
             match result {
                 Ok(applied) => {
                     if stop2.load(Ordering::Relaxed) {
@@ -634,7 +643,8 @@ fn connect_inner_impl(
         match netcfg::remove_gateway_pin(&pin) {
             Ok(()) => {
                 if pin.presence() == Some(false) {
-                    let _ = netcfg::forget_pins(std::slice::from_ref(&pin));
+                    let tag = attempt.as_ref().map(|a| a.id().to_string()).unwrap_or_default();
+                    let _ = netcfg::forget_own(std::slice::from_ref(&pin), &tag);
                 }
                 let _ = log.send(format!("[engine] Removed gateway host route {}.", pin.dest));
             }
@@ -664,14 +674,25 @@ mod tests {
         assert_eq!(parse_vpn_dns(XML), vec![Ipv4Addr::new(172, 16, 5, 53), Ipv4Addr::new(192, 168, 200, 53)]);
         assert_eq!(parse_dns_suffixes(XML), vec!["corp.example".to_string()]);
         assert_eq!(parse_split_dns_domains(XML), vec!["example.com".to_string(), "example.internal".to_string()]);
-        let routes: Vec<String> = parse_split_routes(XML).iter().map(|p| p.to_string()).collect();
+        let (routes, malformed) = parse_split_routes(XML);
+        let routes: Vec<String> = routes.iter().map(|p| p.to_string()).collect();
         assert_eq!(routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+        assert_eq!(malformed.len(), 1, "the bad entry is reported, not silently dropped");
     }
 
     #[test]
     fn attribute_names_match_whole_words() {
         assert_eq!(extract_attr("<addr gwip='1.1.1.1' ip='10.0.0.0'", "ip"), Some("10.0.0.0".into()));
         assert_eq!(extract_attr("<dns gwip='1.1.1.1'", "ip"), None);
+    }
+
+    #[test]
+    fn all_malformed_routes_are_distinguishable_from_none() {
+        let (routes, malformed) = parse_split_routes("<split-tunnel-info><addr ip='x' mask='255.0.0.0' /></split-tunnel-info>");
+        assert!(routes.is_empty());
+        assert_eq!(malformed.len(), 1);
+        let (routes, malformed) = parse_split_routes("<ipv4></ipv4>");
+        assert!(routes.is_empty() && malformed.is_empty(), "no split-tunnel-info = genuinely no routes");
     }
 
     #[test]

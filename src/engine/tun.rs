@@ -1,5 +1,6 @@
 //! TUN interface — lightweight Linux TUN via raw ioctl + ip commands.
 
+use crate::engine::nethelper::Op;
 use crate::engine::VpnError;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -7,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETOWNER: libc::c_ulong = 0x4004_54cc;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFNAMSIZ: usize = 16;
@@ -41,21 +43,6 @@ struct IfReqMtu {
     name: [u8; IFNAMSIZ],
     mtu: libc::c_int,
     _pad: [u8; 20],
-}
-
-/// Run `sudo -n /usr/sbin/ip <args>` and turn a non-zero exit into an error.
-fn sudo_ip(args: &[&str]) -> Result<(), VpnError> {
-    let out = std::process::Command::new("sudo")
-        .arg("-n").arg("/usr/sbin/ip").args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| VpnError::Route(format!("ip command error: {}", e)))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(VpnError::Route(format!(
-            "ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())))
-    }
 }
 
 fn set_name(ifr: &mut IfReq, name: &str) {
@@ -93,6 +80,12 @@ impl TunDevice {
         let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr as *const IfReq as *const libc::c_void) };
         if ret < 0 { return Err(VpnError::Io(io::Error::last_os_error())); }
         let actual = String::from_utf8_lossy(&ifr.name).trim_end_matches('\0').to_string();
+        // Mark the device as ours: the privileged helper only touches TUN
+        // devices owned by the calling user.
+        let uid = unsafe { libc::getuid() } as libc::c_ulong;
+        if unsafe { libc::ioctl(fd, TUNSETOWNER, uid) } < 0 {
+            return Err(VpnError::Io(io::Error::last_os_error()));
+        }
         // Non-blocking so the relay loop can poll TUN + TLS without stalling.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if flags >= 0 {
@@ -135,11 +128,11 @@ impl TunDevice {
             Err(e) => log::warn!("TUN ioctl configure failed: {} — trying sudo ip", e),
         }
 
-        let cidr = format!("{}/32", ip);
-        sudo_ip(&["addr", "flush", "dev", &name])?;
-        sudo_ip(&["addr", "add", &cidr, "dev", &name])?;
-        sudo_ip(&["link", "set", &name, "up"])?;
-        log::info!("TUN {} addr {} (sudo ip)", name, ip);
+        crate::engine::netcfg::tun_ops_noninteractive(&name, self.ifindex(), vec![
+            Op::Addr { ip: ip.to_string() },
+            Op::LinkUp,
+        ]).map_err(|e| VpnError::Route(format!("Failed to set TUN IP address: {}", e)))?;
+        log::info!("TUN {} addr {} (helper)", name, ip);
         Ok(())
     }
 
@@ -167,7 +160,8 @@ impl TunDevice {
             }
             log::warn!("SIOCSIFMTU failed: {} — trying sudo ip", err);
         }
-        sudo_ip(&["link", "set", "dev", &self.name, "mtu", &mtu.to_string()])
+        crate::engine::netcfg::tun_ops_noninteractive(&self.name, self.ifindex(), vec![Op::Mtu { mtu }])
+            .map_err(|e| VpnError::Route(format!("Failed to set TUN MTU: {}", e)))
     }
 
     /// Assign the /32 address and bring the interface UP using ioctls.
