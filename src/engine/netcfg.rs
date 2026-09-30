@@ -399,14 +399,15 @@ pub fn route_get(ip: Ipv4Addr) -> Option<(Option<String>, String)> {
     Some((via, dev))
 }
 
-/// Whether an identical route (same destination and device) already exists.
-pub fn route_exists(dest: Prefix, dev: &str) -> bool {
-    Command::new(IP_BIN)
+/// Whether an identical route (same destination and device) already exists:
+/// Some(true/false), or None when the routing table could not be queried.
+pub fn route_exists(dest: Prefix, dev: &str) -> Option<bool> {
+    let out = Command::new(IP_BIN)
         .args(["-4", "route", "show", "exact", &dest.to_string()])
         .output()
         .ok()
-        .map(|o| parse_route_table(&String::from_utf8_lossy(&o.stdout)).iter().any(|(p, d)| *p == dest && d == dev))
-        .unwrap_or(false)
+        .filter(|o| o.status.success())?;
+    Some(parse_route_table(&String::from_utf8_lossy(&out.stdout)).iter().any(|(p, d)| *p == dest && d == dev))
 }
 
 pub fn current_ifindex(ifname: &str) -> Option<u32> {
@@ -479,17 +480,9 @@ pub fn load_pin_state() -> Vec<PinRecord> {
         .unwrap_or_default()
 }
 
-/// Replace the recorded set of pins (empty = remove the state file).
-pub fn save_pin_state(pins: &[PinRecord]) {
-    let Some(path) = pin_state_path() else { return };
-    if pins.is_empty() {
-        let _ = std::fs::remove_file(path);
-        return;
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let mut text = format!("boot {}\n", boot_id());
+/// Render the state file for `pins` (deduplicated), scoped to this boot.
+fn render_pin_state(pins: &[PinRecord], boot: &str) -> String {
+    let mut text = format!("boot {}\n", boot);
     let mut seen: Vec<&PinRecord> = Vec::new();
     for p in pins {
         if !seen.contains(&p) {
@@ -498,13 +491,73 @@ pub fn save_pin_state(pins: &[PinRecord]) {
             text.push('\n');
         }
     }
-    let _ = std::fs::write(path, text);
+    text
+}
+
+/// Read-modify-write the pin records at `path` under an exclusive lock, so
+/// concurrent sessions apply *changes* instead of overwriting each other's
+/// snapshot. The new content goes to a temp file that is renamed into place
+/// (atomic). Errors are returned: a caller about to install a pin must not
+/// proceed without a durable ownership record.
+fn update_pin_state_at(path: &std::path::Path, boot: &str, f: impl FnOnce(&mut Vec<PinRecord>)) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let dir = path.parent().ok_or("invalid pin state path")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    let lock_path = path.with_extension("lock");
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)
+        .map_err(|e| format!("open {}: {}", lock_path.display(), e))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!("lock {}: {}", lock_path.display(), std::io::Error::last_os_error()));
+    }
+    // The lock is released when `lock` is dropped at the end of this function.
+
+    let mut pins = std::fs::read_to_string(path).map(|t| parse_pin_state(&t, boot)).unwrap_or_default();
+    f(&mut pins);
+
+    if pins.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove {}: {}", path.display(), e)),
+        };
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(render_pin_state(&pins, boot).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("write {}: {}", path.display(), e)
+    })
+}
+
+fn update_pin_state(f: impl FnOnce(&mut Vec<PinRecord>)) -> Result<(), String> {
+    let path = pin_state_path().ok_or("no cache directory (HOME/XDG_CACHE_HOME unset)")?;
+    update_pin_state_at(&path, &boot_id(), f)
+}
+
+/// Record a pin we are about to install (must succeed before installing it).
+pub fn record_pin(pin: &PinRecord) -> Result<(), String> {
+    update_pin_state(|v| if !v.contains(pin) { v.push(pin.clone()) })
+}
+
+/// Forget the given pin records, leaving every other record untouched.
+pub fn forget_pins(pins: &[PinRecord]) -> Result<(), String> {
+    if pins.is_empty() {
+        return Ok(());
+    }
+    update_pin_state(|v| v.retain(|p| !pins.contains(p)))
 }
 
 /// A connection attempt's identity, persisted so that privileged cleanup
 /// started by an *older* attempt (e.g. a pkexec prompt approved after the
 /// user cancelled and reconnected) can tell it is stale and do nothing —
 /// the newer session may own an identical route by then.
+#[derive(Clone)]
 pub struct Attempt {
     id: String,
     path: std::path::PathBuf,
@@ -580,9 +633,10 @@ pub fn remove_pins(pins: &[PinRecord], attempt: Option<&Attempt>) -> Vec<PinReco
 /// those could keep the gateway unreachable. Harmless ones stay deferred to
 /// the route-setup elevation. Returns (still outstanding, removed count).
 pub fn cleanup_stale_pins_before_connect(attempt: Option<&Attempt>) -> (Vec<PinRecord>, usize) {
-    let present: Vec<PinRecord> = load_pin_state().into_iter().filter(|p| p.present()).collect();
+    let (present, gone): (Vec<PinRecord>, Vec<PinRecord>) =
+        load_pin_state().into_iter().partition(|p| p.presence() != Some(false));
+    let _ = forget_pins(&gone); // only drops records confirmed absent
     if present.is_empty() {
-        save_pin_state(&[]);
         return (Vec::new(), 0);
     }
     let remaining = if detect_elevation() == Elevation::Pkexec {
@@ -594,9 +648,11 @@ pub fn cleanup_stale_pins_before_connect(attempt: Option<&Attempt>) -> (Vec<PinR
     } else {
         remove_pins(&present, attempt)
     };
-    let removed = present.len() - remaining.len();
-    save_pin_state(&remaining);
-    (remaining, removed)
+    let removed: Vec<PinRecord> = present.iter().filter(|p| !remaining.contains(p)).cloned().collect();
+    if attempt.map(|a| a.is_current()).unwrap_or(true) {
+        let _ = forget_pins(&removed);
+    }
+    (remaining, removed.len())
 }
 
 /// How network configuration commands should be elevated.
@@ -640,6 +696,9 @@ enum Failure {
     /// `ip route add` hit an identical, already-present route: fine, but that
     /// route is not ours — the kernel's EEXIST is the authoritative signal.
     Preexisting(Prefix),
+    /// EEXIST, but the existing route differs or could not be verified: a
+    /// setup failure — and still evidence that the route is not ours.
+    PreexistingConflict(Prefix, String),
     Fatal(String),
 }
 
@@ -650,10 +709,13 @@ fn classify_failure(cmd: &NetCmd, stderr: &str) -> Failure {
     let stderr = stderr.trim();
     if let (Some(dest), Some(dev)) = (cmd.route, cmd.dev()) {
         if stderr.contains("File exists") {
-            if route_exists(dest, dev) {
-                return Failure::Preexisting(dest);
-            }
-            return Failure::Fatal(format!("{}: a route to {} already exists via another interface", cmd.display(), dest));
+            return match route_exists(dest, dev) {
+                Some(true) => Failure::Preexisting(dest),
+                Some(false) => Failure::PreexistingConflict(dest,
+                    format!("{}: a route to {} already exists via another interface", cmd.display(), dest)),
+                None => Failure::PreexistingConflict(dest,
+                    format!("{}: a route to {} already exists and could not be verified", cmd.display(), dest)),
+            };
         }
     }
     Failure::Fatal(format!("{}: {}", cmd.display(), if stderr.is_empty() { "failed" } else { stderr }))
@@ -692,6 +754,10 @@ fn record_failure(f: Failure, failures: &mut Vec<String>, preexisting: &mut Vec<
     match f {
         Failure::Benign => {}
         Failure::Preexisting(p) => preexisting.push(p),
+        Failure::PreexistingConflict(p, msg) => {
+            preexisting.push(p);
+            failures.push(msg);
+        }
         Failure::Fatal(msg) => failures.push(msg),
     }
 }
@@ -710,11 +776,12 @@ pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, stop: &AtomicB
             let mut failures = Vec::new();
             let mut preexisting = Vec::new();
             for cmd in cmds {
+                // Early exits still report what was learned so far.
                 if stop.load(Ordering::Relaxed) {
-                    return Err(ApplyError::from(String::from("cancelled: disconnect requested during network setup")));
+                    return Err(ApplyError { msg: "cancelled: disconnect requested during network setup".into(), preexisting });
                 }
                 if !still_ours() {
-                    return Err(ApplyError::from(format!("{} was replaced by a newer session; not applying stale config", ifname)));
+                    return Err(ApplyError { msg: format!("{} was replaced by a newer session; not applying stale config", ifname), preexisting });
                 }
                 match Command::new("sudo").arg("-n").args(&cmd.argv).stdin(Stdio::null()).output() {
                     Ok(o) if o.status.success() => {}
@@ -747,12 +814,11 @@ pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, stop: &AtomicB
             };
             let out = out.map_err(|e| ApplyError::from(format!("{}: {}", method, e)))?;
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("OFM_ABORT") {
-                return Err(ApplyError::from(format!("{} was replaced by a newer session; not applying stale config", ifname)));
-            }
             if method == "pkexec" && matches!(out.status.code(), Some(126) | Some(127)) {
                 return Err(ApplyError::from(String::from("the administrator prompt was dismissed or authorization failed — no routes or DNS were applied")));
             }
+            // Collect per-command results first, so an abort part-way through
+            // still reports the pre-existing routes seen before it.
             let mut failures = Vec::new();
             let mut preexisting = Vec::new();
             for line in stderr.lines() {
@@ -762,6 +828,9 @@ pub fn apply(cmds: &[NetCmd], ifname: &str, ifindex: Option<u32>, stop: &AtomicB
                         record_failure(classify_failure(cmd, msg), &mut failures, &mut preexisting);
                     }
                 }
+            }
+            if stderr.contains("OFM_ABORT") {
+                return Err(ApplyError { msg: format!("{} was replaced by a newer session; not applying stale config", ifname), preexisting });
             }
             if !out.status.success() && failures.is_empty() {
                 failures.push(format!("{} exited with {}: {}", method, out.status, stderr.trim()));
@@ -939,6 +1008,53 @@ mod tests {
         record_failure(Failure::Preexisting(Prefix::parse("1.2.3.4/32").unwrap()), &mut failures, &mut pre);
         assert!(failures.is_empty());
         assert_eq!(pre, vec![Prefix::parse("1.2.3.4/32").unwrap()]);
+    }
+
+    fn pin(n: u8) -> PinRecord {
+        PinRecord { dest: p(&format!("198.51.100.{}/32", n)), via: Some(ip("192.168.10.1")), dev: "wlan0".into() }
+    }
+
+    #[test]
+    fn pin_state_updates_are_deltas_not_snapshots() {
+        // Regression: an older session saving its snapshot erased a newer
+        // session's record. Deltas from two sessions must both survive.
+        let dir = std::env::temp_dir().join(format!("ofm-pinstate-{}", std::process::id()));
+        let path = dir.join("gateway-pin");
+        let _ = std::fs::remove_dir_all(&dir);
+        update_pin_state_at(&path, "b1", |v| v.push(pin(1))).unwrap(); // session A
+        update_pin_state_at(&path, "b1", |v| v.push(pin(2))).unwrap(); // session B
+        update_pin_state_at(&path, "b1", |v| v.retain(|x| *x != pin(1))).unwrap(); // A forgets only its own
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_pin_state(&text, "b1"), vec![pin(2)]);
+        // Removing the last record removes the file; no temp file is left behind.
+        update_pin_state_at(&path, "b1", |v| v.clear()).unwrap();
+        assert!(!path.exists());
+        let leftovers = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pin_state_write_failure_is_reported() {
+        // A parent that is a *file* cannot be created: this must be an error,
+        // so setup refuses to install a pin it could not record.
+        let file = std::env::temp_dir().join(format!("ofm-notadir-{}", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let r = update_pin_state_at(&file.join("gateway-pin"), "b1", |v| v.push(pin(1)));
+        assert!(r.is_err());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn eexist_conflict_is_fatal_but_still_preexisting() {
+        let mut failures = Vec::new();
+        let mut pre = Vec::new();
+        record_failure(Failure::PreexistingConflict(p("198.51.100.7/32"), "conflict".into()), &mut failures, &mut pre);
+        assert_eq!(failures, vec!["conflict".to_string()]);
+        assert_eq!(pre, vec![p("198.51.100.7/32")]);
     }
 
     #[test]

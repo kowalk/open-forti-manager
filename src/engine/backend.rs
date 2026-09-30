@@ -381,7 +381,8 @@ fn connect_inner_impl(
                 let _ = log.send("[engine] Connection attempt cancelled.".into());
                 return Ok(());
             }
-            netcfg::save_pin_state(&left);
+            let gone: Vec<netcfg::PinRecord> = pending_pins.iter().filter(|p| !left.contains(p)).cloned().collect();
+            let _ = netcfg::forget_pins(&gone);
             gateway::connect_blocking(profile)?
         }
         Err(e) => return Err(e),
@@ -497,22 +498,18 @@ fn connect_inner_impl(
             netcfg::route_get,
         )?;
 
-        // We own the new gateway pin (and must remove it later) unless the user
-        // already had that exact route. A route equal to one of *our* stale pins
-        // is ours — it gets deleted and re-added by this plan.
-        // Identity (dest + via + dev) decides: a route matching one of *our*
-        // stale records is ours (deleted and re-added by this plan); an
-        // identical route we have no record of belongs to the user.
-        // Tentative until the kernel answers: unknown presence counts as ours
-        // so a crash mid-setup still leaves the pin tracked. After applying,
-        // the add's own result decides — EEXIST means the route pre-existed
-        // and is the user's (unless it is one of our stale records).
+        // Gateway-pin ownership (identity = dest + via + dev). A route matching
+        // one of *our* stale records is ours: this plan deletes and re-adds it.
+        // Otherwise ownership is tentative — unknown presence counts as ours so
+        // a crash mid-setup still leaves the pin tracked — and the kernel's
+        // answer to the add decides: EEXIST means the route is the user's.
         let owned_pin = plan.gw_pin.clone().filter(|pin| stale_pins.contains(pin) || pin.presence() != Some(true));
-        // Record before applying: stale pins stay listed until their deletion
-        // has actually run, and the new pin is listed in case setup fails half-way.
-        let mut recorded = stale_pins.clone();
-        recorded.extend(owned_pin.clone());
-        netcfg::save_pin_state(&recorded);
+        if let Some(pin) = &owned_pin {
+            // The record must be durable *before* the route is installed: an
+            // unrecorded pin could never be found and removed later.
+            netcfg::record_pin(pin).map_err(|e| format!(
+                "cannot record ownership of gateway route {} ({}); refusing to install it", pin.dest, e))?;
+        }
         if let Some(pin) = &owned_pin {
             if let Ok(mut slot) = gw_pin.lock() {
                 *slot = Some(pin.clone());
@@ -551,6 +548,7 @@ fn connect_inner_impl(
         let ifindex = tun.ifindex();
         let dns_check = vpn_dns.clone();
         let gw_pin2 = gw_pin.clone();
+        let attempt2 = attempt.clone();
         thread::spawn(move || {
             let result = netcfg::apply(&plan.cmds, &ifname2, ifindex, &stop2);
             // Kernel said the pin already existed and it isn't one of ours:
@@ -559,32 +557,27 @@ fn connect_inner_impl(
                 Ok(applied) => &applied.preexisting,
                 Err(err) => &err.preexisting,
             };
-            let owned_pin = match &owned_pin {
-                Some(pin) if preexisting.contains(&pin.dest) && !stale_pins.contains(pin) => {
+            // Record changes are deltas (never snapshots), so they can't erase
+            // another session's records. Ownership changes are applied only
+            // while this attempt is still the current one.
+            let current = attempt2.as_ref().map(|a| a.is_current()).unwrap_or(true);
+            if let Some(pin) = &owned_pin {
+                if preexisting.contains(&pin.dest) && !stale_pins.contains(pin) {
                     if let Ok(mut slot) = gw_pin2.lock() {
                         *slot = None;
                     }
-                    None
+                    if current {
+                        let _ = netcfg::forget_pins(std::slice::from_ref(pin));
+                    }
                 }
-                _ => owned_pin,
-            };
-            if result.is_err() {
-                // Keep stale records (their deletion may not have run) and our pin
-                // only if it is ours.
-                let mut keep = stale_pins.clone();
-                keep.extend(owned_pin.clone());
-                netcfg::save_pin_state(&keep);
             }
-            if result.is_ok() {
-                // The batch ran. Keep only stale pins whose (best-effort)
-                // deletion did not actually take effect, plus our new pin.
-                let mut keep: Vec<netcfg::PinRecord> = stale_pins.iter()
-                    .filter(|p| owned_pin.as_ref() != Some(*p) && p.present())
-                    .cloned()
-                    .collect();
-                keep.extend(owned_pin.clone());
-                netcfg::save_pin_state(&keep);
-            }
+            // Stale records whose routes are confirmed gone can be dropped by
+            // anyone; unknown or present ones are kept.
+            let gone: Vec<netcfg::PinRecord> = stale_pins.iter()
+                .filter(|p| p.presence() == Some(false))
+                .cloned()
+                .collect();
+            let _ = netcfg::forget_pins(&gone);
             match result {
                 Ok(applied) => {
                     if stop2.load(Ordering::Relaxed) {
@@ -640,8 +633,9 @@ fn connect_inner_impl(
     if let Some(pin) = pin {
         match netcfg::remove_gateway_pin(&pin) {
             Ok(()) => {
-                let rest: Vec<netcfg::PinRecord> = netcfg::load_pin_state().into_iter().filter(|p| *p != pin).collect();
-                netcfg::save_pin_state(&rest);
+                if pin.presence() == Some(false) {
+                    let _ = netcfg::forget_pins(std::slice::from_ref(&pin));
+                }
                 let _ = log.send(format!("[engine] Removed gateway host route {}.", pin.dest));
             }
             Err(e) => {
