@@ -103,8 +103,9 @@ pub trait SysView {
     fn register_pin(&self, uid: u32, key: &str) -> Result<(), String>;
     fn unregister_pin(&self, uid: u32, key: &str);
     /// Run a whole pin operation (kernel command + registry update) under one
-    /// exclusive lock, so concurrent helpers cannot interleave them.
-    fn with_pin_lock(&self, f: &mut dyn FnMut());
+    /// exclusive lock, so concurrent helpers cannot interleave them. Returns
+    /// false (without running `f`) if the lock cannot be taken.
+    fn with_pin_lock(&self, f: &mut dyn FnMut()) -> bool;
 }
 
 /// Registry key of a pin: `dest via|- dev`.
@@ -342,7 +343,9 @@ pub fn execute(req: &Request, caller: u32, sys: &impl SysView,
             }
         };
         if matches!(op, Op::PinAdd { .. } | Op::PinDel { .. }) {
-            sys.with_pin_lock(&mut body);
+            if !sys.with_pin_lock(&mut body) {
+                result = OpResult { ok: false, stderr: "pin operation lock unavailable; not attempted".into() };
+            }
         } else {
             body();
         }
@@ -441,13 +444,13 @@ impl SysView for RealSys {
         let _ = registry::update(|entries| entries.retain(|(u, k)| !(*u == uid && k == key)));
     }
 
-    fn with_pin_lock(&self, f: &mut dyn FnMut()) {
+    fn with_pin_lock(&self, f: &mut dyn FnMut()) -> bool {
         // A lock file separate from the registry's own (flock on a second
-        // open file of the same path would deadlock). If it cannot be taken,
-        // the operation is still attempted: the registry updates themselves
-        // remain individually locked.
-        let _guard = registry::op_lock();
+        // open file of the same path would deadlock). Without the lock the
+        // operation is refused rather than run unserialized.
+        let Some(_guard) = registry::op_lock() else { return false };
         f();
+        true
     }
 }
 
@@ -581,9 +584,10 @@ mod tests {
             r.push((uid, key.to_string()));
             Ok(())
         }
-        fn with_pin_lock(&self, f: &mut dyn FnMut()) {
+        fn with_pin_lock(&self, f: &mut dyn FnMut()) -> bool {
             *self.locked_ops.borrow_mut() += 1;
             f();
+            true
         }
         fn unregister_pin(&self, uid: u32, key: &str) {
             self.registry.borrow_mut().retain(|(u, k)| !(*u == uid && k == key));
