@@ -390,8 +390,18 @@ impl PppState {
                 self.send_lcp_conf_req();
             }
             CODE_ECHO_REQ => {
-                let magic = self.echo_magic();
-                self.outbox.push(build_ppp(PROTO_LCP, CODE_ECHO_REP, id, &magic));
+                // Reply only once LCP is open, to well-formed requests (the
+                // magic field is mandatory). Carry the request's optional
+                // data back (RFC 1661 §5.8), bounded so the whole LCP packet
+                // fits the peer's MRU (default 1500).
+                let opened = matches!(self.phase, Phase::Ipcp | Phase::Network);
+                if opened && body.len() >= 4 {
+                    let max_data = usize::from(self.peer_mru.unwrap_or(1500)).saturating_sub(8);
+                    let data = &body[4..];
+                    let mut reply = self.echo_magic().to_vec();
+                    reply.extend_from_slice(&data[..data.len().min(max_data)]);
+                    self.outbox.push(build_ppp(PROTO_LCP, CODE_ECHO_REP, id, &reply));
+                }
             }
             CODE_ECHO_REP => {
                 self.echo_outstanding = 0;
@@ -786,6 +796,32 @@ mod tests {
         // A later request that we reject clears a stale ACKed state.
         ppp.handle(&build_ppp(PROTO_IPCP, CODE_CONF_REQ, 7, &[IPCP_OPT_ADDR, 4, 1, 1]));
         assert!(!ppp.ipcp_acked_remote);
+    }
+
+    #[test]
+    fn test_echo_reply_carries_request_data() {
+        // Regression (Copilot): the reply dropped the request's optional data.
+        let mut ppp = PppState::new(Ipv4Addr::new(10, 0, 0, 1), 0xAABB_CCDD);
+        // Before LCP is open: no reply.
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_ECHO_REQ, 7, &[1, 2, 3, 4, b'x']));
+        assert!(ppp.outbox.is_empty());
+        ppp.phase = Phase::Network;
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_ECHO_REQ, 7, &[1, 2, 3, 4, b'p', b'i', b'n', b'g']));
+        let (code, body) = last(&ppp);
+        assert_eq!(code, CODE_ECHO_REP);
+        assert_eq!(&body[..4], &0xAABB_CCDDu32.to_be_bytes(), "our magic, not the peer's");
+        assert_eq!(&body[4..], b"ping");
+        // Too short to hold the magic field: ignored.
+        let n = ppp.outbox.len();
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_ECHO_REQ, 8, &[1, 2]));
+        assert_eq!(ppp.outbox.len(), n);
+        // Data bounded by the peer MRU (total LCP packet <= MRU).
+        ppp.peer_mru = Some(600);
+        let mut big = vec![0u8; 4];
+        big.extend(std::iter::repeat_n(7u8, 2000));
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_ECHO_REQ, 9, &big));
+        let (_, body) = last(&ppp);
+        assert_eq!(body.len(), 4 + (600 - 8));
     }
 
     #[test]
