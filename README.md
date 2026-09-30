@@ -89,7 +89,7 @@ is scoped to the route-table / resolved commands only, *not* a root shell:
 
 ```
 # /etc/sudoers.d/open-forti-manager  (mode 0440)
-%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/sbin/ip addr *, /usr/sbin/ip link *, /usr/bin/resolvectl *
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route show, /usr/sbin/ip route add *, /usr/sbin/ip route del *, /usr/sbin/ip addr add *, /usr/sbin/ip addr flush dev *, /usr/sbin/ip link set *, /usr/bin/resolvectl dns *, /usr/bin/resolvectl domain *
 ```
 
 (The interface IP is assigned in-process via `ioctl` using `CAP_NET_ADMIN`, so

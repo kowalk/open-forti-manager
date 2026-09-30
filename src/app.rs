@@ -420,11 +420,11 @@ impl AppWindow {
             "Keep VPN connection?",
         );
         dialog.set_secondary_text(Some(
-            "You are currently connected. Keep the connection running after closing, or disconnect now?",
+            "You are currently connected. Keep the connection running in the system tray, or disconnect and quit?",
         ));
         dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
         dialog.add_button("Disconnect and Quit", RESP_DISCONNECT);
-        dialog.add_button("Keep Connected", RESP_KEEP);
+        dialog.add_button("Keep Connected in Tray", RESP_KEEP);
         dialog.set_default_response(gtk4::ResponseType::Cancel);
 
         let shared = self.shared.clone();
@@ -434,11 +434,13 @@ impl AppWindow {
         dialog.connect_response(move |dlg, response| {
             match response {
                 RESP_KEEP => {
+                    // The tunnel lives in this process, so quitting would drop
+                    // it. Keep running in the tray instead of exiting.
                     if let Ok(mut s) = shared.write() {
-                        s.force_quit = true;
+                        s.show_window = false;
                     }
                     dlg.close();
-                    window.close();
+                    window.set_visible(false);
                 }
                 RESP_DISCONNECT => {
                     let _ = vpn.borrow_mut().disconnect();

@@ -8,4 +8,7 @@
 #
 # Applies to members of the 'sudo' group (Ubuntu/Debian administrators), who can
 # already run these commands with a password — this only removes the prompt.
-%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/sbin/ip addr *, /usr/sbin/ip link *, /usr/bin/resolvectl *
+# Only the subcommands the app actually issues: route add/del/show, (re)addressing
+# and MTU/up on an interface, and per-link DNS. No 'ip link del', 'addr flush' of
+# arbitrary devices beyond this, or resolvectl global settings.
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route show, /usr/sbin/ip route add *, /usr/sbin/ip route del *, /usr/sbin/ip addr add *, /usr/sbin/ip addr flush dev *, /usr/sbin/ip link set *, /usr/bin/resolvectl dns *, /usr/bin/resolvectl domain *

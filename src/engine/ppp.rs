@@ -31,8 +31,25 @@ impl TunHandle {
         TunWriter { inner: self.tun.clone() }
     }
 
-    pub fn configure(&self, ip: &str) -> Result<(), VpnError> {
+    pub fn configure(&self, ip: std::net::Ipv4Addr) -> Result<(), VpnError> {
         self.tun.lock().unwrap().configure(ip)
+    }
+
+    pub fn set_mtu(&self, mtu: u16) -> Result<(), VpnError> {
+        self.tun.lock().unwrap().set_mtu(mtu)
+    }
+
+    pub fn mtu(&self) -> Option<u16> {
+        self.tun.lock().unwrap().mtu()
+    }
+
+    pub fn ifindex(&self) -> Option<u32> {
+        self.tun.lock().unwrap().ifindex()
+    }
+
+    /// Raw fd of the TUN device (for poll(2) in the relay loop).
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.tun.lock().unwrap().raw_fd()
     }
 
     pub fn iface_name(&self) -> String {

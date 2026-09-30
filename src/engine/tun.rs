@@ -16,6 +16,7 @@ const SIOCSIFADDR: libc::c_ulong = 0x8916;
 const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
 const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
 const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+const SIOCSIFMTU: libc::c_ulong = 0x8922;
 const IFF_UP: libc::c_short = 0x1;
 
 #[repr(C)]
@@ -32,6 +33,29 @@ struct IfReqAddr {
     name: [u8; IFNAMSIZ],
     addr: libc::sockaddr_in,
     _pad: [u8; 8],
+}
+
+/// `struct ifreq` variant carrying `ifr_mtu` (an int), padded to 40 bytes.
+#[repr(C)]
+struct IfReqMtu {
+    name: [u8; IFNAMSIZ],
+    mtu: libc::c_int,
+    _pad: [u8; 20],
+}
+
+/// Run `sudo -n /usr/sbin/ip <args>` and turn a non-zero exit into an error.
+fn sudo_ip(args: &[&str]) -> Result<(), VpnError> {
+    let out = std::process::Command::new("sudo")
+        .arg("-n").arg("/usr/sbin/ip").args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| VpnError::Route(format!("ip command error: {}", e)))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(VpnError::Route(format!(
+            "ip {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())))
+    }
 }
 
 fn set_name(ifr: &mut IfReq, name: &str) {
@@ -80,52 +104,70 @@ impl TunDevice {
 
     pub fn name(&self) -> &str { &self.name }
 
-    /// Bring the interface UP and assign the point-to-point address.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd { self.file.as_raw_fd() }
+
+    /// Kernel interface index (used to prove a later command targets *this*
+    /// session's device and not a newer one that reused the name).
+    pub fn ifindex(&self) -> Option<u32> {
+        std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", self.name))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    /// Bring the interface UP and assign the /32 address (replacing any
+    /// previous one, so this is also used to re-address after IPCP).
     ///
     /// Primary path is in-process `ioctl`, which works with CAP_NET_ADMIN (the
     /// capability the .deb grants) and needs no sudo/exec. Falls back to
-    /// `sudo -n /usr/sbin/ip addr add` (absolute path, matching the packaged
-    /// sudoers rule) for the no-capability case.
-    pub fn configure(&self, ip: &str) -> Result<(), VpnError> {
+    /// `sudo -n /usr/sbin/ip` (absolute path, matching the packaged sudoers
+    /// rule) for the no-capability case.
+    pub fn configure(&self, ip: Ipv4Addr) -> Result<(), VpnError> {
         let name = self.name.clone();
-        let parsed: Option<Ipv4Addr> = ip.split('/').next().and_then(|s| s.parse().ok());
-
-        // Primary: assign address + bring up via ioctl (CAP_NET_ADMIN).
-        if let Some(addr_ip) = parsed {
-            match self.ioctl_configure(&name, addr_ip) {
-                Ok(()) => {
-                    log::info!("TUN {} configured {} via ioctl", name, addr_ip);
-                    return Ok(());
-                }
-                Err(e) => log::warn!("TUN ioctl configure failed: {} — trying sudo ip", e),
-            }
-        } else {
-            log::warn!("TUN configure: could not parse IP {:?}", ip);
+        if ip.is_unspecified() {
+            return Err(VpnError::Route("no IP address assigned by the gateway".into()));
         }
 
-        // Fallback: sudo with the absolute path the sudoers rule allows.
-        let cidr = format!("{}/32", ip.split('/').next().unwrap_or(ip));
-        let output = std::process::Command::new("sudo")
-            .args(["-n", "/usr/sbin/ip", "addr", "add", &cidr, "dev", &name])
-            .output();
-        match &output {
-            Ok(o) if o.status.success() => {
-                // Ensure the link is up as well.
-                let _ = std::process::Command::new("sudo")
-                    .args(["-n", "/usr/sbin/ip", "link", "set", &name, "up"])
-                    .output();
-                log::info!("TUN {} addr {} (sudo ip)", name, ip);
-                Ok(())
+        match self.ioctl_configure(&name, ip) {
+            Ok(()) => {
+                log::info!("TUN {} configured {} via ioctl", name, ip);
+                return Ok(());
             }
-            Ok(o) => {
-                log::error!("sudo ip addr failed: {} {}", o.status, String::from_utf8_lossy(&o.stderr));
-                Err(VpnError::Route(format!(
-                    "Failed to set TUN IP address (no CAP_NET_ADMIN and sudo unavailable): {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                )))
-            }
-            Err(e) => Err(VpnError::Route(format!("ip command error: {}", e))),
+            Err(e) => log::warn!("TUN ioctl configure failed: {} — trying sudo ip", e),
         }
+
+        let cidr = format!("{}/32", ip);
+        sudo_ip(&["addr", "flush", "dev", &name])?;
+        sudo_ip(&["addr", "add", &cidr, "dev", &name])?;
+        sudo_ip(&["link", "set", &name, "up"])?;
+        log::info!("TUN {} addr {} (sudo ip)", name, ip);
+        Ok(())
+    }
+
+    /// Current interface MTU as the kernel reports it.
+    pub fn mtu(&self) -> Option<u16> {
+        std::fs::read_to_string(format!("/sys/class/net/{}/mtu", self.name))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    /// Set the interface MTU (ioctl first, `sudo ip link` fallback).
+    pub fn set_mtu(&self, mtu: u16) -> Result<(), VpnError> {
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if sock >= 0 {
+            let mut req = IfReqMtu { name: [0u8; IFNAMSIZ], mtu: mtu as libc::c_int, _pad: [0u8; 20] };
+            let b = self.name.as_bytes();
+            let len = b.len().min(IFNAMSIZ - 1);
+            req.name[..len].copy_from_slice(&b[..len]);
+            let rc = unsafe { libc::ioctl(sock, SIOCSIFMTU, &req as *const _ as *const libc::c_void) };
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(sock); }
+            if rc == 0 {
+                log::info!("TUN {} MTU {} via ioctl", self.name, mtu);
+                return Ok(());
+            }
+            log::warn!("SIOCSIFMTU failed: {} — trying sudo ip", err);
+        }
+        sudo_ip(&["link", "set", "dev", &self.name, "mtu", &mtu.to_string()])
     }
 
     /// Assign the /32 address and bring the interface UP using ioctls.

@@ -123,6 +123,19 @@ impl AppConfig {
         let path = Self::config_path();
         log::info!("Loading config from {:?}", path);
         if path.exists() {
+            // Older versions wrote this file (which may hold passwords) with
+            // default permissions; tighten it and the directory in place.
+            use std::os::unix::fs::PermissionsExt;
+            for (p, mode) in [(Self::config_dir(), 0o700), (path.clone(), 0o600)] {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)) {
+                            Ok(()) => log::info!("Restricted permissions of {:?} to {:o}", p, mode),
+                            Err(e) => log::warn!("Could not restrict permissions of {:?}: {}", p, e),
+                        }
+                    }
+                }
+            }
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
                     Ok(config) => {
@@ -144,10 +157,27 @@ impl AppConfig {
 
     /// Save configuration to disk.
     pub fn save(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let dir = Self::config_dir();
         std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(Self::config_path(), json)?;
+
+        // The file can hold VPN passwords: write it owner-only (0600) via a temp
+        // file + rename so it is never briefly world-readable or half-written.
+        let path = Self::config_path();
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true).create(true).truncate(true).mode(0o600)
+                .open(&tmp)?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
         log::info!("Config saved");
         Ok(())
     }
