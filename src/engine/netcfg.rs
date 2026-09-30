@@ -243,7 +243,9 @@ pub fn default_routes() -> Vec<RouteEntry> {
 
 pub struct PlanInput<'a> {
     pub ifname: &'a str,
-    pub gateway: Ipv4Addr,
+    /// The gateway's IPv4 address; None when the TLS transport runs over IPv6
+    /// (IPv4 routes cannot capture it, so no gateway pin is needed).
+    pub gateway: Option<Ipv4Addr>,
     pub split: &'a [Prefix],
     pub dns: &'a [Ipv4Addr],
     pub routing_domains: &'a [String],
@@ -302,15 +304,15 @@ pub fn plan(
         }
 
         // The TLS transport must never be routed into its own tunnel.
-        let need_pin = plan.full_tunnel || split.iter().any(|p| p.contains(input.gateway));
-        if need_pin {
-            let (via, dev) = physical_route(input.gateway).ok_or_else(|| format!(
+        let pin_for = input.gateway.filter(|gw| plan.full_tunnel || split.iter().any(|p| p.contains(*gw)));
+        if let Some(gateway) = pin_for {
+            let (via, dev) = physical_route(gateway).ok_or_else(|| format!(
                 "cannot determine the physical route to gateway {}; refusing to install \
-                 routes that would capture the VPN connection itself", input.gateway))?;
+                 routes that would capture the VPN connection itself", gateway))?;
             if dev == ifname {
-                return Err(format!("gateway {} is already routed into {}", input.gateway, ifname));
+                return Err(format!("gateway {} is already routed into {}", gateway, ifname));
             }
-            let pin = PinRecord { dest: Prefix::new(input.gateway, 32), via: via.as_deref().and_then(|v| v.parse().ok()), dev };
+            let pin = PinRecord { dest: Prefix::new(gateway, 32), via: via.as_deref().and_then(|v| v.parse().ok()), dev };
             plan.cmds.push(NetCmd::pin_add(&pin));
             plan.gw_pin = Some(pin);
         }
@@ -325,7 +327,7 @@ pub fn plan(
         // Explicit prefixes are kept even in full-tunnel mode: they can be more
         // specific than a local LAN route that the /1 halves would lose to.
         for p in &split {
-            if p.len == 0 || (p.len == 32 && p.net == input.gateway) {
+            if p.len == 0 || (p.len == 32 && Some(p.net) == input.gateway) {
                 continue; // covered by the /1 halves / pinned to the physical path
             }
             plan.cmds.push(NetCmd::tun_route(*p, ifname));
@@ -336,7 +338,7 @@ pub fn plan(
             // the gateway itself, which must stay on the physical path.
             if input.want_dns {
                 for dns in input.dns {
-                    if *dns != input.gateway && !split.iter().any(|p| p.contains(*dns)) {
+                    if Some(*dns) != input.gateway && !split.iter().any(|p| p.contains(*dns)) {
                         plan.cmds.push(NetCmd::tun_route(Prefix::new(*dns, 32), ifname));
                         plan.route_count += 1;
                         plan.notes.push(format!("Added a host route for VPN DNS server {}.", dns));
@@ -995,7 +997,7 @@ mod tests {
     fn input<'a>(split: &'a [Prefix], dns: &'a [Ipv4Addr]) -> PlanInput<'a> {
         PlanInput {
             ifname: "vpn0",
-            gateway: ip("198.51.100.7"),
+            gateway: Some(ip("198.51.100.7")),
             split,
             dns,
             routing_domains: &[],
@@ -1056,6 +1058,17 @@ mod tests {
         let plan = plan(&input(&[p("0.0.0.0/0"), p("192.168.10.50/32")], &[]), phys).unwrap();
         assert!(plan.full_tunnel);
         assert_eq!(dests(&plan), vec!["198.51.100.7/32", "0.0.0.0/1", "128.0.0.0/1", "192.168.10.50/32"]);
+    }
+
+    #[test]
+    fn ipv6_gateway_gets_no_ipv4_pin() {
+        // Regression (Copilot): an IPv6 TLS peer was mapped to 0.0.0.0 and
+        // full-tunnel planning pinned 0.0.0.0/32.
+        let mut i = input(&[], &[]);
+        i.gateway = None;
+        let plan = plan(&i, |_| panic!("no physical-route lookup without an IPv4 gateway")).unwrap();
+        assert!(plan.full_tunnel && plan.gw_pin.is_none());
+        assert_eq!(dests(&plan), vec!["0.0.0.0/1", "128.0.0.0/1"]);
     }
 
     #[test]

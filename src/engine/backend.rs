@@ -129,6 +129,24 @@ fn parse_vpn_dns(xml: &str) -> Vec<Ipv4Addr> {
     dns
 }
 
+/// Maximum number of DNS servers the network helper accepts per link.
+const MAX_DNS_SERVERS: usize = 8;
+
+/// Effective VPN DNS list: XML servers first, then IPCP-negotiated ones not
+/// already listed; unspecified addresses dropped; capped at
+/// `MAX_DNS_SERVERS`. Returns the list and how many were dropped by the cap.
+fn effective_dns(xml: &[Ipv4Addr], ipcp: [Ipv4Addr; 2]) -> (Vec<Ipv4Addr>, usize) {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for addr in xml.iter().copied().chain(ipcp) {
+        if !addr.is_unspecified() && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    let dropped = out.len().saturating_sub(MAX_DNS_SERVERS);
+    out.truncate(MAX_DNS_SERVERS);
+    (out, dropped)
+}
+
 /// Extract DNS search suffixes from XML (<dns domain='corp.example' />).
 fn parse_dns_suffixes(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -502,9 +520,11 @@ fn connect_inner_impl(
     let want_routes = profile.set_routes != Some(false);
     let want_dns = profile.set_dns != Some(false);
     let half_internet = profile.half_internet_routes == Some(true);
+    // None for an IPv6 transport: IPv4 routes cannot capture it, so there is
+    // no gateway to pin (and no bogus 0.0.0.0 sentinel).
     let gateway_ip = match gateway_addr.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
     };
 
     // Filled by the network-setup worker once routes are in place, so the
@@ -538,6 +558,14 @@ fn connect_inner_impl(
         }
         let applied_mtu = tun.mtu().map(|m| m.to_string()).unwrap_or_else(|| "?".into());
         let _ = log.send(format!("[engine] TUN {} configured with {} (MTU {})", ifname, ip, applied_mtu));
+
+        // DNS servers: the XML list first, then any the gateway supplied via
+        // IPCP (a gateway may provide DNS only there).
+        let (vpn_dns, dropped_dns) = effective_dns(&vpn_dns, [ppp_state.dns1, ppp_state.dns2]);
+        if dropped_dns > 0 {
+            let _ = log.send(format!("[engine] WARNING: gateway offered more than {} DNS servers; using the first {}.",
+                MAX_DNS_SERVERS, MAX_DNS_SERVERS));
+        }
 
         // Always carried (even with Set Routes off) so no recorded pin is forgotten.
         let stale_pins: Vec<netcfg::PinRecord> = if prev_setup_idle {
@@ -652,6 +680,9 @@ fn connect_inner_impl(
                         let _ = log2.send(format!("[engine] WARNING: {} — will retry on the next connect.", w));
                     }
                     for dns in &dns_check {
+                        if Some(*dns) == gateway_ip {
+                            continue; // the gateway itself stays on the physical path by design
+                        }
                         if let Some((_, dev)) = netcfg::route_get(*dns) {
                             if dev != ifname2 && want_routes {
                                 let _ = log2.send(format!(
@@ -768,6 +799,21 @@ mod tests {
     fn attribute_names_match_whole_words() {
         assert_eq!(extract_attr("<addr gwip='1.1.1.1' ip='10.0.0.0'", "ip"), Some("10.0.0.0".into()));
         assert_eq!(extract_attr("<dns gwip='1.1.1.1'", "ip"), None);
+    }
+
+    #[test]
+    fn effective_dns_merges_xml_then_ipcp() {
+        let a = Ipv4Addr::new(172, 16, 5, 53);
+        let b = Ipv4Addr::new(192, 168, 200, 53);
+        let c = Ipv4Addr::new(10, 1, 1, 53);
+        // IPCP-only gateway (regression: previously no DNS at all).
+        assert_eq!(effective_dns(&[], [c, Ipv4Addr::UNSPECIFIED]), (vec![c], 0));
+        // XML order first; IPCP duplicates not repeated; extra IPCP appended.
+        assert_eq!(effective_dns(&[a, b], [b, c]), (vec![a, b, c], 0));
+        // Capped at the helper's limit.
+        let many: Vec<Ipv4Addr> = (1..=9).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let (list, dropped) = effective_dns(&many, [c, Ipv4Addr::UNSPECIFIED]);
+        assert_eq!((list.len(), dropped), (MAX_DNS_SERVERS, 2));
     }
 
     #[test]

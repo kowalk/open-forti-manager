@@ -111,9 +111,10 @@ impl TunDevice {
     /// previous one, so this is also used to re-address after IPCP).
     ///
     /// Primary path is in-process `ioctl`, which works with CAP_NET_ADMIN (the
-    /// capability the .deb grants) and needs no sudo/exec. Falls back to
-    /// `sudo -n /usr/sbin/ip` (absolute path, matching the packaged sudoers
-    /// rule) for the no-capability case.
+    /// capability the .deb grants) and needs no sudo/exec. Without the
+    /// capability it falls back to the validating network helper
+    /// (`/usr/libexec/open-forti-manager-net` via passwordless sudo), never
+    /// prompting; there is no direct `sudo ip` grant.
     pub fn configure(&self, ip: Ipv4Addr) -> Result<(), VpnError> {
         let name = self.name.clone();
         if ip.is_unspecified() {
@@ -125,7 +126,7 @@ impl TunDevice {
                 log::info!("TUN {} configured {} via ioctl", name, ip);
                 return Ok(());
             }
-            Err(e) => log::warn!("TUN ioctl configure failed: {} — trying sudo ip", e),
+            Err(e) => log::warn!("TUN ioctl configure failed: {} — trying the network helper", e),
         }
 
         crate::engine::netcfg::tun_ops_noninteractive(&name, self.ifindex(), vec![
@@ -143,7 +144,8 @@ impl TunDevice {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    /// Set the interface MTU (ioctl first, `sudo ip link` fallback).
+    /// Set the interface MTU (ioctl first; the validating network helper as a
+    /// non-prompting fallback).
     pub fn set_mtu(&self, mtu: u16) -> Result<(), VpnError> {
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock >= 0 {
@@ -158,7 +160,7 @@ impl TunDevice {
                 log::info!("TUN {} MTU {} via ioctl", self.name, mtu);
                 return Ok(());
             }
-            log::warn!("SIOCSIFMTU failed: {} — trying sudo ip", err);
+            log::warn!("SIOCSIFMTU failed: {} — trying the network helper", err);
         }
         crate::engine::netcfg::tun_ops_noninteractive(&self.name, self.ifindex(), vec![Op::Mtu { mtu }])
             .map_err(|e| VpnError::Route(format!("Failed to set TUN MTU: {}", e)))

@@ -473,7 +473,13 @@ impl PppState {
                 // carries DNS anyway). A rejected address cannot be recovered.
                 for (opt, _) in Self::options(body) {
                     match opt {
-                        IPCP_OPT_DNS1 | IPCP_OPT_DNS2 => self.request_dns = false,
+                        IPCP_OPT_DNS1 | IPCP_OPT_DNS2 => {
+                            // Rejected: any values from an earlier NAK were
+                            // never agreed — don't treat them as negotiated.
+                            self.request_dns = false;
+                            self.dns1 = Ipv4Addr::UNSPECIFIED;
+                            self.dns2 = Ipv4Addr::UNSPECIFIED;
+                        }
                         IPCP_OPT_ADDR => {
                             self.die("IPCP: gateway rejected the IP-Address option");
                             return;
