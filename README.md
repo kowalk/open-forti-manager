@@ -74,30 +74,47 @@ capability. You do **not** need to run the whole GUI as root:
   sudo setcap cap_net_admin+eip target/release/open-forti-manager
   ```
 
-Route and DNS setup additionally need root (`ip route`, `resolvectl`). The app
-elevates with the least privilege available, in order:
+Route and DNS setup additionally need root (`ip route`, `resolvectl`). The GUI
+never runs those as root itself: it sends a typed JSON request to a small
+privileged helper, `/usr/libexec/open-forti-manager-net`, which validates every
+operation before running it:
 
-1. run directly if already root;
-2. **passwordless `sudo`** for the exact `ip route` / `resolvectl` commands, if a
-   sudoers rule allows it (no prompt);
+- VPN routes, DNS, address and MTU only on the caller's **own TUN device**
+  (`vpn*`, owned by the calling user, matching interface index);
+- gateway host routes (`/32`) only during the caller's live session and only
+  if they replicate the **current physical path**; deletion only of pins the
+  helper itself installed for the same user (root-owned registry in
+  `/var/lib/open-forti-manager`, routes also marked `proto 157`);
+- no shell, no free-form arguments, and a request from a superseded connection
+  attempt is ignored.
+
+The helper is run with the least privilege available, in order:
+
+1. directly if the app already runs as root;
+2. **passwordless `sudo`** of the helper (no arguments), if the sudoers rule
+   allows it (no prompt);
 3. otherwise a single **`pkexec`** prompt per connect.
 
-The **`.deb` installs the narrow sudoers rule automatically** (validated with
-`visudo` first, and removed on uninstall), so connecting is prompt-free out of
-the box. For a **source build**, add it yourself if you want no prompt — note it
-is scoped to the route-table / resolved commands only, *not* a root shell:
+The **`.deb` installs the helper and its sudoers rule automatically** (validated
+with `visudo` first, and removed on uninstall), so connecting is prompt-free out
+of the box. For a **source build**, install the helper and add the rule yourself
+if you want no prompt:
+
+```bash
+sudo install -m 0755 -o root -g root target/release/open-forti-manager-net /usr/libexec/
+```
 
 ```
 # /etc/sudoers.d/open-forti-manager  (mode 0440)
-%sudo ALL=(root) NOPASSWD: /usr/sbin/ip route *, /usr/sbin/ip -6 route *, /usr/sbin/ip addr *, /usr/sbin/ip link *, /usr/bin/resolvectl *
+%sudo ALL=(root) NOPASSWD: /usr/libexec/open-forti-manager-net ""
 ```
 
-(The interface IP is assigned in-process via `ioctl` using `CAP_NET_ADMIN`, so
-the `ip addr` / `ip link` entries are only a fallback for setups without the
-capability.)
+(The interface IP and MTU are set in-process via `ioctl` using
+`CAP_NET_ADMIN`; the helper's address/MTU operations are only a fallback for
+setups without the capability.)
 
-Without any such rule, everything still works — you just get one `pkexec`
-prompt each time you connect.
+Without the rule, everything still works — you just get one `pkexec` prompt
+each time you connect.
 
 ## Dependencies
 
@@ -169,8 +186,9 @@ sudo apt install -f  # Fix any missing dependencies
 The package's post-install script automatically:
 - runs `setcap cap_net_admin+eip /usr/bin/open-forti-manager`, so the app can
   create the TUN interface without being run as root; and
-- installs the narrow sudoers rule (after validating it with `visudo`), so
-  routes/DNS apply without a prompt. It is removed again on uninstall.
+- installs the privileged network helper to `/usr/libexec/open-forti-manager-net`
+  and a one-line sudoers rule for it (after validating it with `visudo`), so
+  routes/DNS apply without a prompt. The rule is removed again on uninstall.
 
 ## Configuration
 

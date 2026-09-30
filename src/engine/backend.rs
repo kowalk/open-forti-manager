@@ -3,55 +3,101 @@
 //! Implements `VpnBackend` using our pure-Rust engine: TLS → Auth → PPP → Tunnel.
 
 use crate::config::VpnProfile;
+use crate::engine::netcfg::{self, Prefix};
 use crate::engine::{auth, gateway, ppp, tunnel, VpnError};
 use crate::vpn::{ConnectionState, VpnBackend};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Route/DNS setup workers of this process. Teardown and the next connect
+/// wait for them (bounded) before judging or forgetting gateway-pin records:
+/// a worker still in flight may yet install a pin.
+static SETUP_WORKERS: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Wait up to `max` for all setup workers to finish. Returns true when none
+/// is still running.
+fn wait_setup_workers(max: Duration) -> bool {
+    let deadline = Instant::now() + max;
+    loop {
+        let running = {
+            let Ok(mut workers) = SETUP_WORKERS.lock() else { return false };
+            let (done, running): (Vec<_>, Vec<_>) = workers.drain(..).partition(|h| h.is_finished());
+            for h in done {
+                let _ = h.join();
+            }
+            let n = running.len();
+            workers.extend(running);
+            n
+        };
+        if running == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-/// Extract assigned IP from FortiGate XML (attribute form: ipv4='x.x.x.x').
-fn parse_vpn_ip(xml: &str) -> String {
-    // <assigned-addr ipv4='172.16.72.2' />
-    for attr in &["ipv4='", "ipv4=\""] {
-        if let Some(start) = xml.find(attr) {
-            let start = start + attr.len();
-            let end_delim = if attr.contains('\'') { '\'' } else { '"' };
-            if let Some(end) = xml[start..].find(end_delim) {
-                return xml[start..start + end].to_string();
-            }
-        }
-    }
-    "0.0.0.0".to_string()
+/// Extract assigned IP from FortiGate XML (<assigned-addr ipv4='x.x.x.x' />).
+/// Returns 0.0.0.0 when absent — IPCP then asks the gateway for an address.
+fn parse_vpn_ip(xml: &str) -> Ipv4Addr {
+    xml.find("<assigned-addr")
+        .and_then(|start| {
+            let end = xml[start..].find("/>").map(|e| start + e).unwrap_or(xml.len());
+            extract_attr(&xml[start..end], "ipv4")
+        })
+        .and_then(|ip| ip.trim().parse().ok())
+        .unwrap_or(Ipv4Addr::UNSPECIFIED)
 }
 
-/// Extract split-tunnel routes from XML (<addr ip='x.x.x.x' mask='y.y.y.y' />).
-fn parse_split_routes(xml: &str) -> Vec<(String, String)> {
+/// Extract split-tunnel routes from XML (<addr ip='x.x.x.x' mask='y.y.y.y' />),
+/// normalized to network addresses. Entries with an unparsable address or a
+/// non-contiguous mask are returned separately (as their raw tag) so the
+/// caller can report them — malformed policy must not look like "no routes".
+fn parse_split_routes(xml: &str) -> (Vec<Prefix>, Vec<String>) {
     let mut routes = Vec::new();
+    let mut malformed = Vec::new();
     let mut pos = 0;
     while let Some(start) = xml[pos..].find("<addr ") {
         let abs = pos + start;
-        let end = xml[abs..].find("/>").unwrap_or(xml[abs..].len());
+        let Some(end) = xml[abs..].find("/>") else {
+            // Unterminated tag: report it as malformed (never as "no routes",
+            // which would mean full tunnel) and stop — no cursor overrun.
+            malformed.push(xml[abs..].chars().take(120).collect::<String>().trim().to_string());
+            break;
+        };
         let tag = &xml[abs..abs + end];
-        let ip = extract_attr(tag, "ip");
-        let mask = extract_attr(tag, "mask");
-        if let (Some(ip), Some(mask)) = (ip, mask) {
-            // Convert netmask to CIDR prefix length
-            if let Ok(m) = mask.parse::<std::net::Ipv4Addr>() {
-                let prefix = m.octets().iter().map(|b| b.count_ones()).sum::<u32>();
-                routes.push((ip, prefix.to_string()));
+        let ip = extract_attr(tag, "ip").and_then(|s| s.trim().parse::<Ipv4Addr>().ok());
+        let len = extract_attr(tag, "mask")
+            .and_then(|s| s.trim().parse::<Ipv4Addr>().ok())
+            .and_then(netcfg::mask_to_len);
+        match (ip, len) {
+            (Some(ip), Some(len)) => {
+                let p = Prefix::new(ip, len);
+                if !routes.contains(&p) {
+                    routes.push(p);
+                }
             }
+            _ => malformed.push(tag.trim().to_string()),
         }
         pos = abs + end + 2;
     }
-    routes
+    (routes, malformed)
 }
 
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
     for quote in &["'", "\""] {
-        let pat = format!("{}={}", name, quote);
-        if let Some(s) = tag.find(&pat) {
+        // Leading whitespace: `ip=` must not match inside e.g. `gwip=`.
+        let pat = format!(" {}={}", name, quote);
+        let found = tag.find(&pat).or_else(|| {
+            tag.find(&format!("\t{}={}", name, quote)).or_else(|| tag.find(&format!("\n{}={}", name, quote)))
+        });
+        if let Some(s) = found {
             let start = s + pat.len();
             if let Some(e) = tag[start..].find(*quote) {
                 return Some(tag[start..start + e].to_string());
@@ -61,27 +107,64 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Extract DNS servers from XML (<dns ip='x.x.x.x' />).
-fn parse_vpn_dns(xml: &str) -> Vec<String> {
+/// Iterate the attribute text of every `<name ...>` tag.
+fn tags<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let open = format!("<{} ", name);
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = xml[pos..].find(&open) {
+        let abs = pos + start;
+        let end = xml[abs..].find('>').map(|e| abs + e).unwrap_or(xml.len());
+        out.push(&xml[abs..end]);
+        pos = end;
+    }
+    out
+}
+
+/// Extract DNS servers from XML (<dns ip='x.x.x.x' />), IPv4 only.
+fn parse_vpn_dns(xml: &str) -> Vec<Ipv4Addr> {
     let mut dns = Vec::new();
-    for attr in &["ip='", "ip=\""] {
-        let mut search_from = 0;
-        while let Some(pos) = xml[search_from..].find("<dns ") {
-            let abs = search_from + pos;
-            if let Some(start) = xml[abs..].find(attr) {
-                let start = abs + start + attr.len();
-                let end_delim = if attr.contains('\'') { '\'' } else { '"' };
-                if let Some(end) = xml[start..].find(end_delim) {
-                    let addr = &xml[start..start + end];
-                    if !addr.is_empty() && !dns.contains(&addr.to_string()) {
-                        dns.push(addr.to_string());
-                    }
-                }
+    for tag in tags(xml, "dns") {
+        if let Some(addr) = extract_attr(tag, "ip").and_then(|s| s.trim().parse::<Ipv4Addr>().ok()) {
+            if !addr.is_unspecified() && !dns.contains(&addr) {
+                dns.push(addr);
             }
-            search_from = abs + 1;
         }
     }
     dns
+}
+
+/// Maximum number of DNS servers the network helper accepts per link.
+const MAX_DNS_SERVERS: usize = 8;
+
+/// Effective VPN DNS list: XML servers first, then IPCP-negotiated ones not
+/// already listed; unspecified addresses dropped; capped at
+/// `MAX_DNS_SERVERS`. Returns the list and how many were dropped by the cap.
+fn effective_dns(xml: &[Ipv4Addr], ipcp: [Ipv4Addr; 2]) -> (Vec<Ipv4Addr>, usize) {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for addr in xml.iter().copied().chain(ipcp) {
+        if !addr.is_unspecified() && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    let dropped = out.len().saturating_sub(MAX_DNS_SERVERS);
+    out.truncate(MAX_DNS_SERVERS);
+    (out, dropped)
+}
+
+/// Extract DNS search suffixes from XML (<dns domain='corp.example' />).
+fn parse_dns_suffixes(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags(xml, "dns") {
+        if let Some(list) = extract_attr(tag, "domain") {
+            for d in list.split([',', ';', ' ']).map(str::trim).filter(|d| !d.is_empty()) {
+                if !out.iter().any(|x: &String| x == d) {
+                    out.push(d.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Extract split-DNS domains from XML (<split-dns domains='a.com,b.com' .../>).
@@ -91,7 +174,9 @@ fn parse_split_dns_domains(xml: &str) -> Vec<String> {
     let mut pos = 0;
     while let Some(start) = xml[pos..].find("<split-dns ") {
         let abs = pos + start;
-        let end = xml[abs..].find("/>").map(|e| abs + e).unwrap_or(xml.len());
+        let Some(end) = xml[abs..].find("/>").map(|e| abs + e) else {
+            break; // unterminated tag: ignore it, without overrunning the cursor
+        };
         let tag = &xml[abs..end];
         if let Some(list) = extract_attr(tag, "domains") {
             for d in list.split([',', ';', ' ']) {
@@ -104,121 +189,6 @@ fn parse_split_dns_domains(xml: &str) -> Vec<String> {
         pos = end + 2;
     }
     domains
-}
-
-// Absolute paths the app invokes for network config. These must match the
-// Cmnd entries in the packaged sudoers drop-in (debian/open-forti-manager.sudoers)
-// so that `sudo -n` succeeds non-interactively without granting a root shell.
-const IP_BIN: &str = "/usr/sbin/ip";
-const RESOLVECTL_BIN: &str = "/usr/bin/resolvectl";
-
-/// How network configuration commands should be elevated.
-enum Elevation {
-    /// Already root — run directly.
-    Root,
-    /// Narrow passwordless sudo (packaged sudoers rule) — run each command via `sudo -n`.
-    SudoPerCmd,
-    /// No standing privilege — run the batch once behind a graphical pkexec prompt.
-    Pkexec,
-}
-
-/// Decide how to elevate. Probes whether we can run our exact `ip route` command
-/// non-interactively (which the packaged sudoers rule allows); anything broader
-/// like general passwordless sudo also satisfies this probe.
-fn detect_elevation() -> Elevation {
-    use std::process::{Command, Stdio};
-    if unsafe { libc::geteuid() } == 0 {
-        return Elevation::Root;
-    }
-    let can_sudo = Command::new("sudo")
-        .args(["-n", IP_BIN, "route", "show"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if can_sudo { Elevation::SudoPerCmd } else { Elevation::Pkexec }
-}
-
-/// Single-quote an argument for safe inclusion in an `sh -c` batch (used only on
-/// the root/pkexec paths). Prevents e.g. `~domain` from being tilde-expanded.
-fn shell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
-/// Apply the network-config command list with the least privilege available.
-/// Returns (method, ok, detail) for logging. Route-add failures (e.g. a duplicate
-/// route already present) are non-fatal; DNS failures are surfaced.
-fn apply_network_config(commands: &[Vec<String>]) -> (&'static str, bool, String) {
-    use std::process::Command;
-
-    match detect_elevation() {
-        Elevation::SudoPerCmd => {
-            let mut failures = String::new();
-            for cmd in commands {
-                let out = Command::new("sudo").arg("-n").args(cmd).output();
-                match out {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        let is_route = cmd.first().map(|c| c == IP_BIN).unwrap_or(false);
-                        // Ignore "route already exists"-style noise from ip route.
-                        if !is_route {
-                            failures.push_str(&String::from_utf8_lossy(&o.stderr));
-                        }
-                    }
-                    Err(e) => failures.push_str(&e.to_string()),
-                }
-            }
-            ("sudo", failures.is_empty(), failures.trim().to_string())
-        }
-        elev => {
-            // Root or pkexec: run the whole batch in one shell invocation.
-            let script = commands
-                .iter()
-                .map(|c| {
-                    let line = c.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-                    // Tolerate duplicate routes without aborting the batch.
-                    if c.first().map(|x| x == IP_BIN).unwrap_or(false) {
-                        format!("{} 2>/dev/null || true", line)
-                    } else {
-                        line
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let (method, out) = match elev {
-                Elevation::Root => ("root", Command::new("sh").args(["-c", &script]).output()),
-                _ => ("pkexec", Command::new("pkexec").args(["sh", "-c", &script]).output()),
-            };
-            match out {
-                Ok(o) if o.status.success() => (method, true, String::new()),
-                Ok(o) => (method, false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
-                Err(e) => (method, false, e.to_string()),
-            }
-        }
-    }
-}
-
-/// Determine the current physical route to `ip` (before any tunnel routes are
-/// added) by parsing `ip route get`. Returns `(via, dev)` where `via` is the
-/// next-hop gateway (None for a directly-connected subnet). Read-only, no sudo.
-fn physical_route_to(ip: &str) -> Option<(Option<String>, String)> {
-    let out = std::process::Command::new(IP_BIN)
-        .args(["route", "get", ip])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // e.g. "88.217.250.207 via 192.168.10.1 dev wlp0s20f3 src ..." or
-    //      "10.1.2.3 dev eth0 src 10.1.2.4"
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    let via = tokens.iter().position(|&t| t == "via").and_then(|i| tokens.get(i + 1)).map(|s| s.to_string());
-    let dev = tokens.iter().position(|&t| t == "dev").and_then(|i| tokens.get(i + 1)).map(|s| s.to_string())?;
-    Some((via, dev))
 }
 
 /// Native VPN backend that speaks the Fortinet SSL-VPN protocol directly.
@@ -438,32 +408,67 @@ fn connect_inner_impl(
     stop: Arc<AtomicBool>,
     cookie_slot: Arc<Mutex<Option<String>>>,
 ) -> Result<(), VpnError> {
+    // A gateway pin left by an earlier session (e.g. via a router from another
+    // network) could keep the gateway unreachable: clear it before connecting.
+    // Without passwordless privilege this prompts only for *harmful* pins.
+    let attempt = netcfg::Attempt::begin();
+    // Without an attempt id (no /run/user), still tag this connection's pin
+    // records uniquely, so reconnects in one process never share a tag.
+    let fallback_tag = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    // A previous session's setup worker may still be adding a pin (e.g. stuck
+    // on a pkexec prompt): then leave all pin records alone this time — its
+    // record must survive so a later connect can remove that pin.
+    let prev_setup_idle = wait_setup_workers(Duration::from_secs(2));
+    if !prev_setup_idle {
+        let _ = log.send("[engine] A previous network setup is still running — skipping stale-route cleanup this time.".into());
+    }
+    let (pending_pins, removed) = if prev_setup_idle {
+        netcfg::cleanup_stale_pins_before_connect(attempt.as_ref())
+    } else {
+        (Vec::new(), 0)
+    };
+    if removed > 0 {
+        let _ = log.send(format!("[engine] Removed {} stale gateway host route(s) from a previous session.", removed));
+    }
+    if !pending_pins.is_empty() {
+        let _ = log.send(format!("[engine] {} stale gateway host route(s) will be removed during network setup.",
+            pending_pins.len()));
+    }
+
     let _ = log.send("[engine] TLS handshake…".into());
-    let conn = gateway::connect_blocking(profile)?;
+    let conn = match gateway::connect_blocking(profile) {
+        Ok(conn) => conn,
+        // Last resort: a stale pin we did not judge harmful may still be what
+        // breaks the path to the gateway. Only for TCP-connect failures (not
+        // DNS/TLS — e.g. being offline must not prompt), and never for an
+        // attempt the user already cancelled (a newer session may own the
+        // route by now). Remove it (prompting if needed) and retry once.
+        Err(e @ VpnError::Tcp(_)) if !pending_pins.is_empty() && !stop.load(Ordering::Relaxed) => {
+            let _ = log.send(format!("[engine] Connection failed ({}) — removing stale gateway route(s) and retrying…", e));
+            let left = netcfg::remove_pins(&pending_pins, attempt.as_ref());
+            // Cancelled or superseded while the prompt was open: stop here.
+            if stop.load(Ordering::Relaxed) || !attempt.as_ref().map(|a| a.is_current()).unwrap_or(true) {
+                let _ = log.send("[engine] Connection attempt cancelled.".into());
+                return Ok(());
+            }
+            let gone: Vec<netcfg::PinRecord> = pending_pins.iter().filter(|p| !left.contains(p)).cloned().collect();
+            let _ = netcfg::forget_absent(&gone);
+            gateway::connect_blocking(profile)?
+        }
+        Err(e) => return Err(e),
+    };
     let (mut tls_stream, gateway_addr) = (conn.tls_stream, conn.gateway);
     let _ = log.send("[engine] TLS established.".into());
 
     let _ = log.send("[engine] Authenticating…".into());
-    let auth_result = auth::authenticate(&mut tls_stream, profile)?;
+    let auth_result = auth::authenticate(&mut tls_stream, profile, &stop)?;
     let _ = log.send("[engine] Authenticated.".into());
 
     // If SAML, we have a session ID, not a cookie — exchange it now
     let cookie = if profile.saml_login == Some(true) {
         let _ = log.send("[engine] Exchanging SAML session ID…".into());
-        let req = format!(
-            "GET /remote/saml/auth_id?id={} HTTP/1.1\r\n\
-             Host: {}:{}\r\n\
-             User-Agent: FortiSSL-VPN/7.0\r\n\
-             Connection: keep-alive\r\n\
-             \r\n",
-            auth_result.cookie, profile.host, profile.port.unwrap_or(443),
-        );
-        use std::io::Write;
-        tls_stream.write_all(req.as_bytes()).map_err(|e| VpnError::Auth(format!("saml auth_id: {}", e)))?;
-        tls_stream.flush().map_err(|e| VpnError::Auth(format!("flush: {}", e)))?;
-        let resp = auth::read_http_response(&mut tls_stream)?;
-        auth::extract_cookie(&resp)
-            .ok_or_else(|| VpnError::Auth("No SVPNCOOKIE after SAML exchange".into()))?
+        auth::exchange_saml_id(&mut tls_stream, profile, &auth_result.cookie)?
     } else {
         auth_result.cookie
     };
@@ -481,25 +486,40 @@ fn connect_inner_impl(
     let _ = log.send("[engine] Fetching VPN config…".into());
     let config_xml = auth::fetch_config(&mut tls_stream, profile, &cookie)?;
     let _ = log.send(format!("[engine] Config XML ({} bytes): {:.500}", config_xml.len(), config_xml));
-    let vpn_ip = parse_vpn_ip(&config_xml);
+    let xml_ip = parse_vpn_ip(&config_xml);
     let vpn_dns = parse_vpn_dns(&config_xml);
-    let vpn_routes = parse_split_routes(&config_xml);
+    let (vpn_routes, malformed_routes) = parse_split_routes(&config_xml);
     let vpn_domains = parse_split_dns_domains(&config_xml);
-    let _ = log.send(format!("[engine] IP: {}, DNS: {:?}, Domains: {:?}, Routes: {}",
-        vpn_ip, vpn_dns, vpn_domains, vpn_routes.len()));
+    let vpn_suffixes = parse_dns_suffixes(&config_xml);
+    let _ = log.send(format!("[engine] IP: {}, DNS: {:?}, Domains: {:?}, Search: {:?}, Routes: {}",
+        xml_ip, vpn_dns, vpn_domains, vpn_suffixes, vpn_routes.len()));
+
+    // Malformed split routes: warn and continue if some are valid; fail if
+    // none are (an empty list would otherwise be taken as a full tunnel).
+    if !malformed_routes.is_empty() && profile.set_routes != Some(false) {
+        let sample: Vec<&str> = malformed_routes.iter().take(5).map(|s| s.as_str()).collect();
+        if vpn_routes.is_empty() {
+            return Err(VpnError::Route(format!(
+                "the gateway advertised {} split route(s) but none could be parsed (e.g. {:?}); \
+                 refusing to guess the routing policy", malformed_routes.len(), sample)));
+        }
+        let _ = log.send(format!(
+            "[engine] WARNING: skipped {} malformed split route(s) from the gateway — those networks \
+             will NOT go through the VPN: {:?}", malformed_routes.len(), sample));
+    }
+
+    if stop.load(Ordering::Relaxed) {
+        let _ = log.send("[engine] Disconnect requested during setup — aborting.".into());
+        return Ok(());
+    }
 
     let _ = log.send("[engine] Starting tunnel mode…".into());
     auth::start_tunnel(&mut tls_stream, profile, &cookie)?;
 
     let _ = log.send("[engine] Creating TUN interface…".into());
     let tun = ppp::TunHandle::open()?;
-    let _ = log.send(format!("[engine] TUN {} ready", tun.iface_name()));
-
-    // Assign IP and set up routes
-    if let Err(e) = tun.configure(&vpn_ip) {
-        let _ = log.send(format!("[engine] WARNING: Failed to set IP: {}", e));
-    }
-    let _ = log.send(format!("[engine] TUN {} configured with {}", tun.iface_name(), vpn_ip));
+    let ifname = tun.iface_name();
+    let _ = log.send(format!("[engine] TUN {} ready — negotiating PPP…", ifname));
 
     // Honor the profile's Set-DNS / Set-Routes / Half-Internet options.
     // "Default" (None) keeps the historical always-on behavior; only an explicit
@@ -507,112 +527,328 @@ fn connect_inner_impl(
     let want_routes = profile.set_routes != Some(false);
     let want_dns = profile.set_dns != Some(false);
     let half_internet = profile.half_internet_routes == Some(true);
+    // None for an IPv6 transport: IPv4 routes cannot capture it, so there is
+    // no gateway to pin (and no bogus 0.0.0.0 sentinel).
+    let gateway_ip = match gateway_addr.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    };
 
-    // Build the route + DNS commands as an explicit argv list, so each matches
-    // the narrow packaged sudoers rule (no root shell).
-    let ifname = tun.iface_name();
-    let mut commands: Vec<Vec<String>> = Vec::new();
-    let mut route_count = 0usize;
+    // Filled by the network-setup worker once routes are in place, so the
+    // pinned gateway route can be removed on the way out.
+    let gw_pin: Arc<Mutex<Option<netcfg::PinRecord>>> = Arc::new(Mutex::new(None));
 
-    if want_routes {
-        if half_internet {
-            // Full tunnel via two /1 routes (more specific than the default /0,
-            // so they win without replacing it). First pin a host route to the
-            // VPN gateway over the *physical* path, otherwise the /1 routes would
-            // capture the tunnel's own TLS connection and break it.
-            let gw_ip = gateway_addr.ip().to_string();
-            if let Some((via, dev)) = physical_route_to(&gw_ip) {
-                let mut cmd = vec![IP_BIN.into(), "route".into(), "add".into(), format!("{}/32", gw_ip)];
-                if let Some(via) = via { cmd.push("via".into()); cmd.push(via); }
-                cmd.push("dev".into()); cmd.push(dev);
-                commands.push(cmd);
-                let _ = log.send(format!("[engine] Half-internet: pinned gateway {} to physical route", gw_ip));
-            } else {
-                let _ = log.send(format!(
-                    "[engine] WARNING: could not determine physical route to gateway {} — half-internet may drop the tunnel", gw_ip));
-            }
-            for net in ["0.0.0.0/1", "128.0.0.0/1"] {
-                commands.push(vec![IP_BIN.into(), "route".into(), "add".into(),
-                    net.into(), "dev".into(), ifname.clone()]);
-                route_count += 1;
-            }
-        } else {
-            for (net, mask) in &vpn_routes {
-                commands.push(vec![
-                    IP_BIN.into(), "route".into(), "add".into(),
-                    format!("{}/{}", net, mask), "dev".into(), ifname.clone(),
-                ]);
-                route_count += 1;
+    // Runs once IPCP completes: configure the interface with the *negotiated*
+    // address and MTU, then apply routes/DNS. "Tunnel UP!" (which flips the UI
+    // to Connected) is only sent after all of that succeeded.
+    let on_network = |ppp_state: &crate::engine::pppstate::PppState| -> Result<(), String> {
+        let ip = ppp_state.local_ip;
+        if !xml_ip.is_unspecified() && ip != xml_ip {
+            let _ = log.send(format!("[engine] Gateway assigned {} via IPCP (config said {}) — using the negotiated address.", ip, xml_ip));
+        }
+        tun.configure(ip).map_err(|e| format!("failed to set the tunnel IP address: {}", e))?;
+        // The MTU must not exceed what the gateway accepts, or large packets
+        // are black-holed ("connected but sites don't load"). If setting it
+        // fails, continue only when the interface is already within the limit.
+        let mtu = ppp_state.tun_mtu();
+        if let Err(e) = tun.set_mtu(mtu) {
+            match tun.mtu() {
+                Some(actual) if actual <= mtu => {
+                    let _ = log.send(format!(
+                        "[engine] WARNING: could not set MTU {} on {} ({}); current MTU {} is within the gateway's limit — continuing.",
+                        mtu, ifname, e, actual));
+                }
+                actual => return Err(format!(
+                    "could not set the tunnel MTU to {} (interface MTU is {}): {}",
+                    mtu, actual.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into()), e)),
             }
         }
-    }
+        let applied_mtu = tun.mtu().map(|m| m.to_string()).unwrap_or_else(|| "?".into());
+        let _ = log.send(format!("[engine] TUN {} configured with {} (MTU {})", ifname, ip, applied_mtu));
 
-    if want_dns && !vpn_dns.is_empty() {
-        let mut dns_cmd = vec![RESOLVECTL_BIN.into(), "dns".into(), ifname.clone()];
-        dns_cmd.extend(vpn_dns.iter().cloned());
-        commands.push(dns_cmd);
+        // DNS servers: the XML list first, then any the gateway supplied via
+        // IPCP (a gateway may provide DNS only there).
+        let (vpn_dns, dropped_dns) = effective_dns(&vpn_dns, [ppp_state.dns1, ppp_state.dns2]);
+        if dropped_dns > 0 {
+            let _ = log.send(format!("[engine] WARNING: gateway offered more than {} DNS servers; using the first {}.",
+                MAX_DNS_SERVERS, MAX_DNS_SERVERS));
+        }
 
-        // Route the split-DNS domains to the VPN DNS servers. The '~' prefix
-        // marks them as routing-only domains so *.domain lookups use vpn0's DNS.
-        // Fall back to a wildcard so all lookups prefer the VPN DNS if the
-        // gateway didn't advertise any split-DNS domains.
-        let domain_args: Vec<String> = if vpn_domains.is_empty() {
-            vec!["~.".to_string()]
+        // Always carried (even with Set Routes off) so no recorded pin is forgotten.
+        let stale_pins: Vec<netcfg::PinRecord> = if prev_setup_idle {
+            netcfg::load_pin_state().into_iter().filter(|p| p.present()).collect()
         } else {
-            vpn_domains.iter().map(|d| format!("~{}", d)).collect()
+            Vec::new()
         };
-        let mut dom_cmd = vec![RESOLVECTL_BIN.into(), "domain".into(), ifname.clone()];
-        dom_cmd.extend(domain_args);
-        commands.push(dom_cmd);
-    }
+        let plan = netcfg::plan(
+            &netcfg::PlanInput {
+                ifname: &ifname,
+                gateway: gateway_ip,
+                split: &vpn_routes,
+                dns: &vpn_dns,
+                routing_domains: &vpn_domains,
+                search_domains: &vpn_suffixes,
+                want_routes,
+                want_dns,
+                half_internet,
+                stale_pins: &stale_pins,
+                dns_backend: netcfg::resolved_active(),
+            },
+            netcfg::route_get,
+        )?;
 
-    if commands.is_empty() {
-        let _ = log.send("[engine] Skipping route/DNS setup (disabled in profile).".into());
-    } else {
-        let applied_dns = want_dns && !vpn_dns.is_empty();
-        let log2 = log.clone();
-        std::thread::spawn(move || {
-            let (method, ok, detail) = apply_network_config(&commands);
-            if ok {
-                let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", method));
-            } else {
-                let _ = log2.send(format!(
-                    "[engine] WARNING: network setup via {} failed{}. Internal hosts may not resolve.",
-                    method,
-                    if detail.is_empty() { String::new() } else { format!(": {}", detail) },
-                ));
+        // Gateway-pin ownership (identity = dest + via + dev). A route matching
+        // one of *our* stale records is ours: this plan deletes and re-adds it.
+        // Otherwise ownership is tentative — unknown presence counts as ours so
+        // a crash mid-setup still leaves the pin tracked — and the kernel's
+        // answer to the add decides: EEXIST means the route is the user's.
+        let owned_pin = plan.gw_pin.clone().filter(|pin| stale_pins.contains(pin) || pin.presence() != Some(true));
+        // Without an attempt id (no /run/user), still tag uniquely per process
+        // so entries of different sessions never share a tag.
+        let attempt_tag = attempt.as_ref().map(|a| a.id().to_string())
+            .unwrap_or_else(|| fallback_tag.clone());
+        if let Some(pin) = &owned_pin {
+            // The record must be durable *before* the route is installed: an
+            // unrecorded pin could never be found and removed later.
+            netcfg::record_pin(pin, &attempt_tag).map_err(|e| format!(
+                "cannot record ownership of gateway route {} ({}); refusing to install it", pin.dest, e))?;
+        }
+        if let Some(pin) = &owned_pin {
+            if let Ok(mut slot) = gw_pin.lock() {
+                *slot = Some(pin.clone());
             }
-        });
+        }
+        for note in &plan.notes {
+            let _ = log.send(format!("[engine] {}", note));
+        }
+
+        if want_routes && !plan.full_tunnel {
+            let table = netcfg::read_route_table();
+            for (vpn, local, dev) in netcfg::shadowed_ranges(&vpn_routes, &ifname, &table) {
+                let _ = log.send(format!(
+                    "[engine] WARNING: VPN range {} is partly shadowed by local route {} on {} — hosts in {} will NOT go through the VPN.", vpn, local, dev, local));
+            }
+        }
+        if plan.cmds.is_empty() {
+            let _ = log.send("[engine] Skipping route/DNS setup (disabled in profile).".into());
+            let _ = log.send("[engine] Tunnel UP! (native TUN)".into());
+            return Ok(());
+        }
+
         let _ = log.send(format!(
             "[engine] Applying {} route(s){}{} — a privilege prompt may appear if no sudoers rule is installed…",
-            route_count,
-            if half_internet { " [half-internet]" } else { "" },
-            if applied_dns { format!(" + DNS ({} domains)", vpn_domains.len()) } else { String::new() },
+            plan.route_count,
+            if plan.full_tunnel { " [full tunnel]" } else { "" },
+            if want_dns && !vpn_dns.is_empty() { " + DNS" } else { "" },
         ));
-    }
-    // Disconnect requested while we were still setting up? Bail out before
-    // entering the relay loop; dropping the TUN/TLS handles tears everything down.
-    if stop.load(Ordering::Relaxed) {
-        let _ = log.send("[engine] Disconnect requested during setup — aborting.".into());
-        return Ok(());
-    }
+
+        // Apply off the relay thread: a pkexec prompt can take a while and the
+        // relay must keep answering LCP echoes meanwhile. The worker is bound
+        // to this session via the stop flag and the interface index.
+        let log2 = log.clone();
+        let stop2 = stop.clone();
+        let ifname2 = ifname.clone();
+        let ifindex = tun.ifindex();
+        let dns_check = vpn_dns.clone();
+        let gw_pin2 = gw_pin.clone();
+        let attempt2 = attempt.clone();
+        let attempt_tag2 = attempt_tag.clone();
+        let worker = thread::spawn(move || {
+            let result = netcfg::apply(&plan.cmds, &ifname2, ifindex, attempt2.as_ref(), &stop2);
+            // Kernel said the pin already existed and it isn't one of ours:
+            // it belongs to the user — never track or delete it.
+            let preexisting = match &result {
+                Ok(applied) => &applied.preexisting,
+                Err(err) => &err.preexisting,
+            };
+            // Record changes are tagged deltas, never snapshots. Retracting our
+            // own tentative claim is always allowed (even if superseded);
+            // other entries are dropped only when confirmed gone and not
+            // owned by the current attempt.
+            // EEXIST proves the route is the user's only if no earlier setup
+            // worker could have added it meanwhile; otherwise keep the claim
+            // (a later connect cleans it up via the helper's registry).
+            if let Some(pin) = &owned_pin {
+                if prev_setup_idle && preexisting.contains(&pin.dest) && !stale_pins.contains(pin) {
+                    if let Ok(mut slot) = gw_pin2.lock() {
+                        *slot = None;
+                    }
+                    let _ = netcfg::forget_own(std::slice::from_ref(pin), &attempt_tag2);
+                }
+            }
+            let _ = netcfg::forget_absent(&stale_pins);
+            match result {
+                Ok(applied) => {
+                    if stop2.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = log2.send(format!("[engine] Routes + DNS applied via {}.", applied.method));
+                    for w in &applied.warnings {
+                        let _ = log2.send(format!("[engine] WARNING: {} — will retry on the next connect.", w));
+                    }
+                    for dns in &dns_check {
+                        if Some(*dns) == gateway_ip {
+                            continue; // the gateway itself stays on the physical path by design
+                        }
+                        if let Some((_, dev)) = netcfg::route_get(*dns) {
+                            if dev != ifname2 && want_routes {
+                                let _ = log2.send(format!(
+                                    "[engine] WARNING: VPN DNS server {} is routed via {} instead of {}.", dns, dev, ifname2));
+                            }
+                        }
+                    }
+                    let _ = log2.send("[engine] Tunnel UP! (native TUN)".into());
+                }
+                Err(e) => {
+                    if stop2.load(Ordering::Relaxed) && e.msg.starts_with("cancelled") {
+                        return;
+                    }
+                    let _ = log2.send(format!("[engine] ERROR: network setup failed — {}", e));
+                    // A tunnel without its routes is not a working connection:
+                    // tear it down so the UI shows the error, not "Connected".
+                    stop2.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        if let Ok(mut workers) = SETUP_WORKERS.lock() {
+            workers.push(worker);
+        }
+        Ok(())
+    };
 
     let ppp_in = tun.writer();
     let ppp_out = tun.reader();
 
-    // Set TLS non-blocking for polling
+    // Set TLS non-blocking for polling (preserving the other file flags).
     use std::os::unix::io::AsRawFd;
     let tls_fd = tls_stream.get_ref().as_raw_fd();
-    unsafe { libc::fcntl(tls_fd, libc::F_SETFL, libc::O_NONBLOCK); }
+    unsafe {
+        let flags = libc::fcntl(tls_fd, libc::F_GETFL, 0);
+        libc::fcntl(tls_fd, libc::F_SETFL, if flags < 0 { libc::O_NONBLOCK } else { flags | libc::O_NONBLOCK });
+    }
+    let fds = tunnel::RelayFds { tls: tls_fd, tun: tun.raw_fd() };
+    // Bound rustls' unsent-TLS buffer explicitly (this is also its default):
+    // together with the relay's own queue it caps outbound backlog, so TUN
+    // reads stop under backpressure instead of buffering without limit.
+    tls_stream.conn.set_buffer_limit(Some(tunnel::TLS_SEND_BUFFER));
 
-    let _ = log.send("[engine] Tunnel UP! (native TUN)".into());
     let _ = log.send("[engine] Entering relay loop…".into());
+    let result = tunnel::run_relay(
+        tls_stream, ppp_in, ppp_out, Some(fds), xml_ip, Some(log.clone()), stop.clone(), on_network);
 
-    let local_ip: std::net::Ipv4Addr = vpn_ip.split('/').next().unwrap_or(&vpn_ip)
-        .parse()
-        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    // Clean up the gateway host route (it lives on the physical interface) —
+    // but only once the setup worker is done: while it runs it may still add
+    // the pin, so judging "absent" now could forget a pin about to appear.
+    stop.store(true, Ordering::Relaxed);
+    let setup_done = wait_setup_workers(Duration::from_secs(5));
+    let pin = gw_pin.lock().ok().and_then(|p| p.clone());
+    if pin.is_some() && !setup_done {
+        let _ = log.send("[engine] WARNING: network setup still in progress — keeping the gateway route record; \
+            it will be cleaned up on a later connect.".into());
+    }
+    // A newer connection may already use an identical pin (the helper's
+    // registry cannot tell them apart), so only a still-current attempt may
+    // delete it; the helper re-checks the attempt inside its pin lock. With
+    // no verifiable attempt id, keep the record for a later cleanup.
+    let current_attempt = attempt.as_ref().filter(|a| a.is_current());
+    let pin = match (pin, current_attempt) {
+        (Some(pin), None) if setup_done => {
+            let _ = log.send(format!(
+                "[engine] A newer connection has started (or no attempt id) — keeping gateway route {} for later cleanup.",
+                pin.dest));
+            None
+        }
+        (pin, _) => pin,
+    };
+    if let (Some(pin), Some(current)) = (pin.filter(|_| setup_done), current_attempt) {
+        match netcfg::remove_gateway_pin(&pin, current) {
+            Ok(()) => {
+                if pin.presence() == Some(false) {
+                    let tag = attempt.as_ref().map(|a| a.id().to_string())
+                        .unwrap_or_else(|| fallback_tag.clone());
+                    let _ = netcfg::forget_own(std::slice::from_ref(&pin), &tag);
+                }
+                let _ = log.send(format!("[engine] Removed gateway host route {}.", pin.dest));
+            }
+            Err(e) => {
+                let _ = log.send(format!("[engine] WARNING: {} — it will be removed on the next connect.", e));
+            }
+        }
+    }
+    drop(tun);
+    result.map_err(VpnError::Tunnel)
+}
 
-    let _alive = tun;
-    tunnel::run_relay(tls_stream, ppp_in, ppp_out, local_ip, Some(log.clone()), stop);
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XML: &str = "<?xml version='1.0' encoding='utf-8'?><sslvpn-tunnel ver='2' dtls='1' patch='1'>\
+        <ipv4><dns ip='172.16.5.53' /><dns ip='192.168.200.53' /><dns domain='corp.example' />\
+        <split-dns domains='example.com,example.internal' dnsserver1='172.16.5.53' />\
+        <assigned-addr ipv4='10.66.1.2' />\
+        <split-tunnel-info><addr ip='10.0.0.0' mask='255.0.0.0' /><addr ip='172.16.5.1' mask='255.240.0.0' />\
+        <addr ip='bad' mask='255.0.0.0' /><addr ip='10.0.0.0' mask='255.0.0.0' /></split-tunnel-info></ipv4></sslvpn-tunnel>";
+
+    #[test]
+    fn parses_gateway_config() {
+        assert_eq!(parse_vpn_ip(XML), Ipv4Addr::new(10, 66, 1, 2));
+        assert_eq!(parse_vpn_dns(XML), vec![Ipv4Addr::new(172, 16, 5, 53), Ipv4Addr::new(192, 168, 200, 53)]);
+        assert_eq!(parse_dns_suffixes(XML), vec!["corp.example".to_string()]);
+        assert_eq!(parse_split_dns_domains(XML), vec!["example.com".to_string(), "example.internal".to_string()]);
+        let (routes, malformed) = parse_split_routes(XML);
+        let routes: Vec<String> = routes.iter().map(|p| p.to_string()).collect();
+        assert_eq!(routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+        assert_eq!(malformed.len(), 1, "the bad entry is reported, not silently dropped");
+    }
+
+    #[test]
+    fn attribute_names_match_whole_words() {
+        assert_eq!(extract_attr("<addr gwip='1.1.1.1' ip='10.0.0.0'", "ip"), Some("10.0.0.0".into()));
+        assert_eq!(extract_attr("<dns gwip='1.1.1.1'", "ip"), None);
+    }
+
+    #[test]
+    fn unterminated_tags_do_not_panic() {
+        // Regression (Copilot): the cursor overran the text and the next slice panicked.
+        let (routes, malformed) = parse_split_routes("<split-tunnel-info><addr ip='10.0.0.0' mask='255.0.0.0'");
+        assert!(routes.is_empty());
+        assert_eq!(malformed.len(), 1, "reported as malformed, so it can never mean full tunnel");
+        let (routes, malformed) = parse_split_routes("<addr ip='10.0.0.0' mask='255.0.0.0' /><addr ");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(malformed.len(), 1);
+        assert!(parse_split_routes("<addr ").1.len() == 1);
+        assert!(parse_split_dns_domains("<split-dns ").is_empty());
+        assert_eq!(parse_split_dns_domains("<split-dns domains='a.example' /><split-dns domains='b"),
+            vec!["a.example".to_string()]);
+    }
+
+    #[test]
+    fn effective_dns_merges_xml_then_ipcp() {
+        let a = Ipv4Addr::new(172, 16, 5, 53);
+        let b = Ipv4Addr::new(192, 168, 200, 53);
+        let c = Ipv4Addr::new(10, 1, 1, 53);
+        // IPCP-only gateway (regression: previously no DNS at all).
+        assert_eq!(effective_dns(&[], [c, Ipv4Addr::UNSPECIFIED]), (vec![c], 0));
+        // XML order first; IPCP duplicates not repeated; extra IPCP appended.
+        assert_eq!(effective_dns(&[a, b], [b, c]), (vec![a, b, c], 0));
+        // Capped at the helper's limit.
+        let many: Vec<Ipv4Addr> = (1..=9).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let (list, dropped) = effective_dns(&many, [c, Ipv4Addr::UNSPECIFIED]);
+        assert_eq!((list.len(), dropped), (MAX_DNS_SERVERS, 2));
+    }
+
+    #[test]
+    fn all_malformed_routes_are_distinguishable_from_none() {
+        let (routes, malformed) = parse_split_routes("<split-tunnel-info><addr ip='x' mask='255.0.0.0' /></split-tunnel-info>");
+        assert!(routes.is_empty());
+        assert_eq!(malformed.len(), 1);
+        let (routes, malformed) = parse_split_routes("<ipv4></ipv4>");
+        assert!(routes.is_empty() && malformed.is_empty(), "no split-tunnel-info = genuinely no routes");
+    }
+
+    #[test]
+    fn missing_assigned_addr_is_unspecified() {
+        assert_eq!(parse_vpn_ip("<sslvpn-tunnel></sslvpn-tunnel>"), Ipv4Addr::UNSPECIFIED);
+    }
 }

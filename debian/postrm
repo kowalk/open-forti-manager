@@ -16,4 +16,9 @@ case "$1" in
         ;;
 esac
 
+# On purge, also drop the helper's root-owned pin registry.
+if [ "$1" = "purge" ] && [ -d /var/lib/open-forti-manager ]; then
+    rm -rf /var/lib/open-forti-manager
+fi
+
 exit 0

@@ -1,6 +1,6 @@
 [package]
 name = "open-forti-manager"
-version = "1.0.8"
+version = "1.1.0"
 edition = "2024"
 description = "Native Fortinet SSL-VPN client for Linux with a GTK4 GUI — pure-Rust TLS, SAML, and PPP/IPCP engine (no openfortivpn or pppd), system tray, and profile management"
 license = "MIT"
@@ -38,6 +38,9 @@ maintainer-scripts = "debian/"
 assets = [
     ["target/release/open-forti-manager", "usr/bin/open-forti-manager", "755"],
     ["assets/open-forti-manager.desktop", "usr/share/applications/open-forti-manager.desktop", "644"],
+    # Privileged network helper (run as root only via sudo/pkexec; no file
+    # capabilities). It validates every operation — see src/engine/nethelper.rs.
+    ["target/release/open-forti-manager-net", "usr/libexec/open-forti-manager-net", "755"],
     # Staged sudoers rule; postinst validates it with visudo before installing
     # it into /etc/sudoers.d/ (never shipped there directly, to avoid a bad
     # file breaking sudo system-wide).

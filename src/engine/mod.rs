@@ -10,10 +10,11 @@ pub mod auth;
 pub mod backend;
 pub mod gateway;
 pub mod hdlc;
+pub mod netcfg;
+pub mod nethelper;
 pub mod http_server;
 pub mod ppp;
 pub mod pppstate;
-pub mod routes;
 pub mod tun;
 pub mod tunnel;
 
@@ -44,6 +45,7 @@ pub enum VpnError {
     Auth(String),
     Io(std::io::Error),
     Route(String),
+    Tunnel(String),
 }
 
 impl std::fmt::Display for VpnError {
@@ -55,6 +57,7 @@ impl std::fmt::Display for VpnError {
             VpnError::Auth(s) => write!(f, "Auth error: {}", s),
             VpnError::Io(e) => write!(f, "I/O error: {}", e),
             VpnError::Route(s) => write!(f, "Route error: {}", s),
+            VpnError::Tunnel(s) => write!(f, "Tunnel error: {}", s),
         }
     }
 }

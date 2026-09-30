@@ -67,6 +67,15 @@ jobs:
           fi
           echo "postinst correctly sets cap_net_admin on install."
 
+      - name: Verify the privileged network helper is packaged
+        run: |
+          DEB="${{ steps.deb.outputs.path }}"
+          if ! dpkg-deb --contents "$DEB" | grep -q "./usr/libexec/open-forti-manager-net$"; then
+            echo "::error::.deb is missing /usr/libexec/open-forti-manager-net"
+            exit 1
+          fi
+          echo "network helper is packaged."
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
