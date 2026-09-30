@@ -65,7 +65,12 @@ fn parse_split_routes(xml: &str) -> (Vec<Prefix>, Vec<String>) {
     let mut pos = 0;
     while let Some(start) = xml[pos..].find("<addr ") {
         let abs = pos + start;
-        let end = xml[abs..].find("/>").unwrap_or(xml[abs..].len());
+        let Some(end) = xml[abs..].find("/>") else {
+            // Unterminated tag: report it as malformed (never as "no routes",
+            // which would mean full tunnel) and stop — no cursor overrun.
+            malformed.push(xml[abs..].chars().take(120).collect::<String>().trim().to_string());
+            break;
+        };
         let tag = &xml[abs..abs + end];
         let ip = extract_attr(tag, "ip").and_then(|s| s.trim().parse::<Ipv4Addr>().ok());
         let len = extract_attr(tag, "mask")
@@ -169,7 +174,9 @@ fn parse_split_dns_domains(xml: &str) -> Vec<String> {
     let mut pos = 0;
     while let Some(start) = xml[pos..].find("<split-dns ") {
         let abs = pos + start;
-        let end = xml[abs..].find("/>").map(|e| abs + e).unwrap_or(xml.len());
+        let Some(end) = xml[abs..].find("/>").map(|e| abs + e) else {
+            break; // unterminated tag: ignore it, without overrunning the cursor
+        };
         let tag = &xml[abs..end];
         if let Some(list) = extract_attr(tag, "domains") {
             for d in list.split([',', ';', ' ']) {
@@ -799,6 +806,21 @@ mod tests {
     fn attribute_names_match_whole_words() {
         assert_eq!(extract_attr("<addr gwip='1.1.1.1' ip='10.0.0.0'", "ip"), Some("10.0.0.0".into()));
         assert_eq!(extract_attr("<dns gwip='1.1.1.1'", "ip"), None);
+    }
+
+    #[test]
+    fn unterminated_tags_do_not_panic() {
+        // Regression (Copilot): the cursor overran the text and the next slice panicked.
+        let (routes, malformed) = parse_split_routes("<split-tunnel-info><addr ip='10.0.0.0' mask='255.0.0.0'");
+        assert!(routes.is_empty());
+        assert_eq!(malformed.len(), 1, "reported as malformed, so it can never mean full tunnel");
+        let (routes, malformed) = parse_split_routes("<addr ip='10.0.0.0' mask='255.0.0.0' /><addr ");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(malformed.len(), 1);
+        assert!(parse_split_routes("<addr ").1.len() == 1);
+        assert!(parse_split_dns_domains("<split-dns ").is_empty());
+        assert_eq!(parse_split_dns_domains("<split-dns domains='a.example' /><split-dns domains='b"),
+            vec!["a.example".to_string()]);
     }
 
     #[test]

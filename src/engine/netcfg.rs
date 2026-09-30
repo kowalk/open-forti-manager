@@ -459,12 +459,40 @@ pub fn resolved_active() -> bool {
     linked || stub || nss
 }
 
-/// Where gateway pins that could not be removed yet are remembered.
+/// Where gateway pins that could not be removed yet are remembered. This is
+/// needed to undo privileged routes later, so it lives in persistent state
+/// (`$XDG_STATE_HOME`, default `~/.local/state`), not in the disposable cache.
 fn pin_state_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("open-forti-manager").join("gateway-pin"))
+}
+
+/// Previous location (disposable cache), migrated on first update.
+fn legacy_pin_state_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
     Some(base.join("open-forti-manager").join("gateway-pin"))
+}
+
+/// Read one pin-state file: missing = no entries; other errors are returned.
+fn read_pin_entries(path: &std::path::Path, boot: &str) -> Result<Vec<(PinRecord, String)>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(parse_pin_entries(&t, boot)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("read {}: {}", path.display(), e)),
+    }
+}
+
+/// Add legacy entries whose identity is not already present.
+fn merge_legacy(entries: &mut Vec<(PinRecord, String)>, legacy: Vec<(PinRecord, String)>) {
+    for (p, t) in legacy {
+        if !entries.iter().any(|(q, _)| *q == p) {
+            entries.push((p, t));
+        }
+    }
 }
 
 /// Routes don't survive a reboot, so records are scoped to the current boot.
@@ -512,10 +540,13 @@ fn parse_pin_state(text: &str, current_boot: &str) -> Vec<PinRecord> {
 
 /// Gateway pins this app installed but has not yet removed.
 pub fn load_pin_state() -> Vec<PinRecord> {
-    pin_state_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| parse_pin_state(&t, &boot_id()))
-        .unwrap_or_default()
+    let boot = boot_id();
+    let mut entries = pin_state_path().and_then(|p| read_pin_entries(&p, &boot).ok()).unwrap_or_default();
+    // Not yet migrated entries from the old cache location still count.
+    if let Some(legacy) = legacy_pin_state_path().and_then(|p| read_pin_entries(&p, &boot).ok()) {
+        merge_legacy(&mut entries, legacy);
+    }
+    entries.into_iter().map(|(p, _)| p).collect()
 }
 
 fn render_pin_entries(entries: &[(PinRecord, String)], boot: &str) -> String {
@@ -537,7 +568,11 @@ fn render_pin_entries(entries: &[(PinRecord, String)], boot: &str) -> String {
 /// (atomic). Only a missing file counts as "no entries"; any other read error
 /// is returned, so unreadable state is never silently replaced. Errors are
 /// returned to the caller: a pin must not be installed without its record.
-fn update_pin_state_at(path: &std::path::Path, boot: &str,
+///
+/// `legacy` is the old cache location: its entries are merged in (never
+/// overwriting existing state) and the old file is removed only after the
+/// new state was durably written.
+fn update_pin_state_at(path: &std::path::Path, legacy: Option<&std::path::Path>, boot: &str,
                        f: impl FnOnce(&mut Vec<(PinRecord, String)>)) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let dir = path.parent().ok_or("invalid pin state path")?;
@@ -550,17 +585,23 @@ fn update_pin_state_at(path: &std::path::Path, boot: &str,
     }
     // The lock is released when `lock` is dropped at the end of this function.
 
-    let mut entries = match std::fs::read_to_string(path) {
-        Ok(t) => parse_pin_entries(&t, boot),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
-    };
+    let mut entries = read_pin_entries(path, boot)?;
+    let legacy = legacy.filter(|l| l.exists() && *l != path);
+    if let Some(l) = legacy {
+        merge_legacy(&mut entries, read_pin_entries(l, boot)?);
+    }
     f(&mut entries);
+    // After the new state is durable, drop the migrated legacy file.
+    let retire_legacy = || {
+        if let Some(l) = legacy {
+            let _ = std::fs::remove_file(l);
+        }
+    };
 
     if entries.is_empty() {
         return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => { retire_legacy(); Ok(()) }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { retire_legacy(); Ok(()) }
             Err(e) => Err(format!("remove {}: {}", path.display(), e)),
         };
     }
@@ -575,12 +616,14 @@ fn update_pin_state_at(path: &std::path::Path, boot: &str,
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("write {}: {}", path.display(), e)
-    })
+    })?;
+    retire_legacy();
+    Ok(())
 }
 
 fn update_pin_state(f: impl FnOnce(&mut Vec<(PinRecord, String)>)) -> Result<(), String> {
-    let path = pin_state_path().ok_or("no cache directory (HOME/XDG_CACHE_HOME unset)")?;
-    update_pin_state_at(&path, &boot_id(), f)
+    let path = pin_state_path().ok_or("no state directory (HOME/XDG_STATE_HOME unset)")?;
+    update_pin_state_at(&path, legacy_pin_state_path().as_deref(), &boot_id(), f)
 }
 
 /// Record a pin this attempt is about to install (must succeed before
@@ -1203,13 +1246,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ofm-pinstate-{}", std::process::id()));
         let path = dir.join("gateway-pin");
         let _ = std::fs::remove_dir_all(&dir);
-        update_pin_state_at(&path, "b1", |v| v.push((pin(1), "100-1".into()))).unwrap(); // session A
-        update_pin_state_at(&path, "b1", |v| v.push((pin(2), "200-2".into()))).unwrap(); // session B
-        update_pin_state_at(&path, "b1", |v| v.retain(|(x, _)| *x != pin(1))).unwrap(); // A forgets only its own
+        update_pin_state_at(&path, None, "b1", |v| v.push((pin(1), "100-1".into()))).unwrap(); // session A
+        update_pin_state_at(&path, None, "b1", |v| v.push((pin(2), "200-2".into()))).unwrap(); // session B
+        update_pin_state_at(&path, None, "b1", |v| v.retain(|(x, _)| *x != pin(1))).unwrap(); // A forgets only its own
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(parse_pin_state(&text, "b1"), vec![pin(2)]);
         // Removing the last record removes the file; no temp file is left behind.
-        update_pin_state_at(&path, "b1", |v| v.clear()).unwrap();
+        update_pin_state_at(&path, None, "b1", |v| v.clear()).unwrap();
         assert!(!path.exists());
         let leftovers = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok())
@@ -1225,7 +1268,7 @@ mod tests {
         // so setup refuses to install a pin it could not record.
         let file = std::env::temp_dir().join(format!("ofm-notadir-{}", std::process::id()));
         std::fs::write(&file, "x").unwrap();
-        let r = update_pin_state_at(&file.join("gateway-pin"), "b1", |v| v.push((pin(1), String::new())));
+        let r = update_pin_state_at(&file.join("gateway-pin"), None, "b1", |v| v.push((pin(1), String::new())));
         assert!(r.is_err());
         let _ = std::fs::remove_file(file);
     }
@@ -1237,8 +1280,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ofm-unreadable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("gateway-pin")).unwrap(); // a directory: read fails with EISDIR
-        let r = update_pin_state_at(&dir.join("gateway-pin"), "b1", |v| v.push((pin(1), String::new())));
+        let r = update_pin_state_at(&dir.join("gateway-pin"), None, "b1", |v| v.push((pin(1), String::new())));
         assert!(r.unwrap_err().starts_with("read "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_cache_records_are_migrated_not_lost() {
+        // Regression (Copilot): records lived in the disposable cache. They
+        // now live in persistent state; old entries are merged in (never
+        // overwriting existing state) and the old file is retired afterwards.
+        let dir = std::env::temp_dir().join(format!("ofm-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let new = dir.join("state").join("gateway-pin");
+        let old = dir.join("cache").join("gateway-pin");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, render_pin_entries(&[(pin(1), "100-1".into())], "b1")).unwrap();
+        // First update after upgrade: legacy entry is kept alongside the new one.
+        update_pin_state_at(&new, Some(&old), "b1", |v| v.push((pin(2), "200-2".into()))).unwrap();
+        let text = std::fs::read_to_string(&new).unwrap();
+        assert_eq!(parse_pin_state(&text, "b1"), vec![pin(1), pin(2)]);
+        assert!(!old.exists(), "legacy file retired after a durable write");
+        // An existing new-state entry is never overwritten by a legacy one.
+        std::fs::write(&old, render_pin_entries(&[(pin(2), "999-9".into())], "b1")).unwrap();
+        update_pin_state_at(&new, Some(&old), "b1", |_| {}).unwrap();
+        let entries = parse_pin_entries(&std::fs::read_to_string(&new).unwrap(), "b1");
+        assert_eq!(entries.iter().find(|(p, _)| *p == pin(2)).unwrap().1, "200-2");
+        // An unreadable legacy file is an error, not "no entries".
+        std::fs::remove_file(&old).ok();
+        std::fs::create_dir_all(&old).unwrap();
+        assert!(update_pin_state_at(&new, Some(&old), "b1", |_| {}).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
