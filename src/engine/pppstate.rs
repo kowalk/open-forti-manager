@@ -325,8 +325,18 @@ impl PppState {
                                 nak.extend_from_slice(&suggest.to_be_bytes());
                             }
                         }
-                        (LCP_OPT_MRU, _) => nak.extend_from_slice(&[LCP_OPT_MRU, 4, 0x05, 0xDC]),
                         (LCP_OPT_ACCM, 6) | (LCP_OPT_PFC, 2) | (LCP_OPT_ACFC, 2) => {}
+                        // Recognized options with a wrong length: NAK with the
+                        // correct form (RFC 1661 §6), not Reject.
+                        (LCP_OPT_MRU, _) => nak.extend_from_slice(&[LCP_OPT_MRU, 4, 0x05, 0xDC]),
+                        (LCP_OPT_MAGIC, _) => {
+                            let suggest = (self.magic.rotate_left(7) ^ 0x5A5A_A5A5).max(1);
+                            nak.extend_from_slice(&[LCP_OPT_MAGIC, 6]);
+                            nak.extend_from_slice(&suggest.to_be_bytes());
+                        }
+                        (LCP_OPT_ACCM, _) => nak.extend_from_slice(&[LCP_OPT_ACCM, 6, 0, 0, 0, 0]),
+                        (LCP_OPT_PFC, _) => nak.extend_from_slice(&[LCP_OPT_PFC, 2]),
+                        (LCP_OPT_ACFC, _) => nak.extend_from_slice(&[LCP_OPT_ACFC, 2]),
                         _ => reject.extend_from_slice(chunk),
                     }
                 }
@@ -409,6 +419,9 @@ impl PppState {
                 // Gateway's IPCP request: only a well-formed IP-Address option
                 // is ACKed; anything else (e.g. IP-Compression-Protocol, which
                 // would only permit *us* to compress, RFC 1332 §4) is rejected.
+                // A malformed IP-Address is rejected rather than NAK'd: a NAK
+                // would have to suggest the gateway's own address, which only
+                // the gateway knows.
                 let Some(opts) = Self::options_strict(body) else {
                     return; // malformed: silently discard
                 };
@@ -730,9 +743,15 @@ mod tests {
         assert_eq!(&body[..4], &[LCP_OPT_MRU, 4, 0x05, 0xDC]);
         assert_eq!(&body[4..6], &[LCP_OPT_MAGIC, 6]);
         assert_ne!(&body[6..10], &[0, 0, 0, 0]);
-        // A PFC option with a bad length is rejected (not silently ACKed).
+        // Recognized options with a bad length are NAK'd with the correct
+        // form (not silently ACKed, not rejected).
         ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 3, &[LCP_OPT_PFC, 3, 0]));
-        assert_eq!(last(&ppp).0, CODE_CONF_REJ);
+        assert_eq!(last(&ppp), (CODE_CONF_NAK, vec![LCP_OPT_PFC, 2]));
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 4, &[LCP_OPT_ACCM, 4, 0, 0]));
+        assert_eq!(last(&ppp), (CODE_CONF_NAK, vec![LCP_OPT_ACCM, 6, 0, 0, 0, 0]));
+        // Unknown options still win: any reject is sent before NAKs.
+        ppp.handle(&build_ppp(PROTO_LCP, CODE_CONF_REQ, 5, &[LCP_OPT_PFC, 3, 0, 13, 3, 6]));
+        assert_eq!(last(&ppp), (CODE_CONF_REJ, vec![13, 3, 6]));
     }
 
     #[test]

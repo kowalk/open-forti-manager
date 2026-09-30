@@ -630,8 +630,11 @@ fn connect_inner_impl(
             // own tentative claim is always allowed (even if superseded);
             // other entries are dropped only when confirmed gone and not
             // owned by the current attempt.
+            // EEXIST proves the route is the user's only if no earlier setup
+            // worker could have added it meanwhile; otherwise keep the claim
+            // (a later connect cleans it up via the helper's registry).
             if let Some(pin) = &owned_pin {
-                if preexisting.contains(&pin.dest) && !stale_pins.contains(pin) {
+                if prev_setup_idle && preexisting.contains(&pin.dest) && !stale_pins.contains(pin) {
                     if let Ok(mut slot) = gw_pin2.lock() {
                         *slot = None;
                     }
